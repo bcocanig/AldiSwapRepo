@@ -157,7 +157,7 @@ function Assert-SubDirectory {
 function Initialize-OneNoteApp {
     <#
     .SYNOPSIS Loads the OneNote COM interop assembly and creates the application object.
-              Idempotent — safe to call multiple times.
+              Idempotent - safe to call multiple times.
     #>
     if ($Script:OneNoteApp) { return }
 
@@ -778,13 +778,13 @@ function Get-InstalledAppInventory {
 }
 
 # ============================================================
-# REGION: BACKUP DESTINATION — ONEDRIVE / F DRIVE
+# REGION: BACKUP DESTINATION - ONEDRIVE / F DRIVE
 # ============================================================
 
 function Backup-ToOneDrive {
     $oneDrive = Get-OneDrivePath
     if (-not $oneDrive) {
-        Write-Log 'Cannot back up to OneDrive — path not found.' -Level ERROR
+        Write-Log 'Cannot back up to OneDrive - path not found.' -Level ERROR
         return
     }
 
@@ -800,7 +800,7 @@ function Backup-ToOneDrive {
 function Backup-ToFDrive {
     $fDrive = Get-FDrivePath
     if (-not $fDrive) {
-        Write-Log 'F Drive not available — skipping F Drive backup.' -Level WARN
+        Write-Log 'F Drive not available - skipping F Drive backup.' -Level WARN
         return
     }
 
@@ -1274,15 +1274,15 @@ function Invoke-IntegrityCheck {
         if (Test-Path $sigDest) {
             $destCount = @(Get-ChildItem $sigDest -Recurse -File).Count
             if ($destCount -ge $backupCount) {
-                $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';   Status = 'PASS'; Detail = "$backupCount file(s) backed up — $destCount present on device" })
+                $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';   Status = 'PASS'; Detail = "$backupCount file(s) backed up - $destCount present on device" })
             } else {
-                $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';   Status = 'WARN'; Detail = "Backup had $backupCount file(s) — only $destCount found on device" })
+                $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';   Status = 'WARN'; Detail = "Backup had $backupCount file(s) - only $destCount found on device" })
             }
         } else {
             $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';       Status = 'FAIL'; Detail = "Destination folder missing: $sigDest" })
         }
     } else {
-        $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';           Status = 'WARN'; Detail = 'No backup found — user may not have had any signatures' })
+        $checks.Add([PSCustomObject]@{ Check = 'Email Signatures';           Status = 'WARN'; Detail = 'No backup found - user may not have had any signatures' })
     }
 
     # ── 2. Quick Access Pins ─────────────────────────────────
@@ -1294,9 +1294,9 @@ function Invoke-IntegrityCheck {
         if (Test-Path $qaDest) {
             $destCount = @(Get-ChildItem $qaDest -File).Count
             if ($destCount -ge $backupCount) {
-                $checks.Add([PSCustomObject]@{ Check = 'Quick Access Pins';  Status = 'PASS'; Detail = "$backupCount file(s) backed up — $destCount present in destination" })
+                $checks.Add([PSCustomObject]@{ Check = 'Quick Access Pins';  Status = 'PASS'; Detail = "$backupCount file(s) backed up - $destCount present in destination" })
             } else {
-                $checks.Add([PSCustomObject]@{ Check = 'Quick Access Pins';  Status = 'WARN'; Detail = "Backup had $backupCount file(s) — only $destCount found in destination" })
+                $checks.Add([PSCustomObject]@{ Check = 'Quick Access Pins';  Status = 'WARN'; Detail = "Backup had $backupCount file(s) - only $destCount found in destination" })
             }
         } else {
             $checks.Add([PSCustomObject]@{ Check = 'Quick Access Pins';      Status = 'FAIL'; Detail = "Destination folder missing: $qaDest" })
@@ -1323,7 +1323,7 @@ function Invoke-IntegrityCheck {
                 $checks.Add([PSCustomObject]@{ Check = 'OneNote Notebooks';  Status = 'WARN'; Detail = "$($missing.Count) missing: $($missing -join ', ')" })
             }
         } catch {
-            $checks.Add([PSCustomObject]@{ Check = 'OneNote Notebooks';      Status = 'WARN'; Detail = "Could not verify — OneNote may still be loading ($_)" })
+            $checks.Add([PSCustomObject]@{ Check = 'OneNote Notebooks';      Status = 'WARN'; Detail = "Could not verify - OneNote may still be loading ($_)" })
         }
     } else {
         $checks.Add([PSCustomObject]@{ Check = 'OneNote Notebooks';          Status = 'WARN'; Detail = 'OneNoteBooks.json not found in backup' })
@@ -1340,9 +1340,9 @@ function Invoke-IntegrityCheck {
                 Get-Member -MemberType NoteProperty |
                 Where-Object { $_.Name -notmatch '^PS' }
             ).Count
-            $checks.Add([PSCustomObject]@{ Check = 'OneNote Registry';       Status = 'PASS'; Detail = "Key present — $valueCount notebook entry(s) registered" })
+            $checks.Add([PSCustomObject]@{ Check = 'OneNote Registry';       Status = 'PASS'; Detail = "Key present - $valueCount notebook entry(s) registered" })
         } else {
-            $checks.Add([PSCustomObject]@{ Check = 'OneNote Registry';       Status = 'FAIL'; Detail = 'Registry key absent after import — notebooks may not reopen automatically' })
+            $checks.Add([PSCustomObject]@{ Check = 'OneNote Registry';       Status = 'FAIL'; Detail = 'Registry key absent after import - notebooks may not reopen automatically' })
         }
     } else {
         $checks.Add([PSCustomObject]@{ Check = 'OneNote Registry';           Status = 'WARN'; Detail = 'OneNote registry backup file not found' })
@@ -1350,7 +1350,7 @@ function Invoke-IntegrityCheck {
 
     # ── 5. Outlook Profiles ──────────────────────────────────
     if ($OutlookFree) {
-        $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles';           Status = 'PASS'; Detail = 'Skipped — Outlook-free restore mode' })
+        $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles';           Status = 'PASS'; Detail = 'Skipped - Outlook-free restore mode' })
     } else {
         $outlookRegFile = Join-Path $Script:WorkingDir 'OutlookReg\OldPcOutlook.reg'
         $outlookRegKey  = 'HKCU:\Software\Microsoft\Office\16.0\Outlook\Profiles'
@@ -1361,10 +1361,10 @@ function Invoke-IntegrityCheck {
                 if ($profileCount -gt 0) {
                     $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles'; Status = 'PASS'; Detail = "$profileCount profile(s) present in registry" })
                 } else {
-                    $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles'; Status = 'WARN'; Detail = 'Profiles key exists but is empty — open Outlook to complete profile creation' })
+                    $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles'; Status = 'WARN'; Detail = 'Profiles key exists but is empty - open Outlook to complete profile creation' })
                 }
             } else {
-                $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles';   Status = 'FAIL'; Detail = 'Outlook Profiles registry key absent — import may have failed' })
+                $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles';   Status = 'FAIL'; Detail = 'Outlook Profiles registry key absent - import may have failed' })
             }
         } else {
             $checks.Add([PSCustomObject]@{ Check = 'Outlook Profiles';       Status = 'WARN'; Detail = 'Outlook registry backup file not found' })
@@ -1378,7 +1378,7 @@ function Invoke-IntegrityCheck {
         $zips = @(Get-ChildItem $dlDir -Filter '*.zip' -File)
         if ($zips.Count -gt 0) {
             $sizeMB = [math]::Round(($zips | Measure-Object Length -Sum).Sum / 1MB, 1)
-            $checks.Add([PSCustomObject]@{ Check = 'Downloads Backup';       Status = 'PASS'; Detail = "$($zips.Count) zip(s) present — ${sizeMB} MB total. Restore manually from: $dlDir" })
+            $checks.Add([PSCustomObject]@{ Check = 'Downloads Backup';       Status = 'PASS'; Detail = "$($zips.Count) zip(s) present - ${sizeMB} MB total. Restore manually from: $dlDir" })
         } else {
             $checks.Add([PSCustomObject]@{ Check = 'Downloads Backup';       Status = 'WARN'; Detail = 'Backup folder exists but contains no zip files' })
         }
