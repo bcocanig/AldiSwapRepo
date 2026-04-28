@@ -1443,28 +1443,37 @@ function Show-Menu {
 # REGION: ENTRY POINT
 # ============================================================
 
-while ($true) {
-    Show-Menu
-    $selection = (Read-Host 'Selection').Trim().ToUpper()
+try {
+    while ($true) {
+        Show-Menu
+        $selection = (Read-Host 'Selection').Trim().ToUpper()
 
-    switch ($selection) {
-        '1' { Start-Backup }
-        '2' { Start-OneDriveRestore }
-        '3' { Start-FDriveRestore }
-        '4' { Start-OneDriveRestoreWithoutOutlook }
-        '5' { Repair-OutlookRegistry }
-        '6' { Get-InstalledAppInventory }
-        '7' {
-            $p = Get-OneDrivePath
-            if ($p) { Write-Log "OneDrive OK: $p" -Level SUCCESS }
-            else     { Write-Log 'OneDrive NOT found.' -Level WARN }
+        switch ($selection) {
+            '1' { Start-Backup }
+            '2' { Start-OneDriveRestore }
+            '3' { Start-FDriveRestore }
+            '4' { Start-OneDriveRestoreWithoutOutlook }
+            '5' { Repair-OutlookRegistry }
+            '6' { Get-InstalledAppInventory }
+            '7' {
+                $p = Get-OneDrivePath
+                if ($p) { Write-Log "OneDrive OK: $p" -Level SUCCESS }
+                else     { Write-Log 'OneDrive NOT found.' -Level WARN }
+            }
+            '8' {
+                $p = Get-FDrivePath
+                if ($p) { Write-Log "F Drive OK: $p" -Level SUCCESS }
+                else     { Write-Log 'F Drive NOT found.' -Level WARN }
+            }
+            'Q' { Write-Host 'Goodbye.'; exit 0 }
+            default { Write-Host "  Invalid selection: '$selection'" -ForegroundColor Yellow }
         }
-        '8' {
-            $p = Get-FDrivePath
-            if ($p) { Write-Log "F Drive OK: $p" -Level SUCCESS }
-            else     { Write-Log 'F Drive NOT found.' -Level WARN }
-        }
-        'Q' { Write-Host 'Goodbye.'; exit 0 }
-        default { Write-Host "  Invalid selection: '$selection'" -ForegroundColor Yellow }
     }
+} catch {
+    Write-Host ''
+    Write-Host "FATAL ERROR: $_" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+} finally {
+    Write-Host ''
+    Read-Host 'Press Enter to close'
 }
