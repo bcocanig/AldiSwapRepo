@@ -72,12 +72,12 @@ function Start-LogSession {
     #>
     param([string]$Operation = 'Session')
 
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $Script:LogFile = Join-Path $Script:LogDir "Log_${Operation}_${stamp}.txt"
+
     if (-not (Test-Path $Script:LogDir)) {
         New-Item -ItemType Directory -Path $Script:LogDir -Force | Out-Null
     }
-
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $Script:LogFile = Join-Path $Script:LogDir "Log_${Operation}_${stamp}.txt"
     New-Item -Path $Script:LogFile -ItemType File -Force | Out-Null
     Write-Log "Log session started: $($Script:LogFile)"
 }
