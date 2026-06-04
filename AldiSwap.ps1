@@ -15,7 +15,9 @@
       * Reusable helpers (reg export/import, robocopy, waits) - no copy-paste.
       * One data-driven backup + one restore pipeline (replaces 5 near-identical ones).
       * Every step wrapped: a failure logs and continues, never kills the session.
-      * Approved verbs, UTF-8 everywhere, exit-code checks, elevation check.
+      * Late-bound OneNote COM + auto-detected Office version (no fragile GAC/2013 schema).
+      * Edge/Chrome bookmarks captured; a readable manifest.json travels with each backup.
+      * Approved verbs, StrictMode, UTF-8 everywhere, exit-code checks. No admin required.
 
 .NOTES
     Original authors : Brandon Cocanig (11/23/2023), Chris Zeyen (Outlook fix).
@@ -30,11 +32,31 @@ param(
     [switch]$Import
 )
 
+Set-StrictMode -Version Latest      # surfaces typos / unset variables instead of failing silently
+$ErrorActionPreference = 'Stop'     # cmdlet errors throw and are caught per-step by the pipeline
+
+function Get-OfficeVersion {
+    # Highest installed Office version key (e.g. 16.0) that actually contains Outlook/OneNote.
+    # Replaces the old hardcoded '16.0' so registry paths follow the machine, not an assumption.
+    try {
+        $root = 'HKCU:\Software\Microsoft\Office'
+        if (Test-Path $root) {
+            $hit = Get-ChildItem $root -ErrorAction SilentlyContinue |
+                   Where-Object { $_.PSChildName -match '^\d{2}\.\d$' } |
+                   Sort-Object { [double]$_.PSChildName } -Descending |
+                   Where-Object { (Test-Path (Join-Path $_.PSPath 'Outlook')) -or (Test-Path (Join-Path $_.PSPath 'OneNote')) } |
+                   Select-Object -First 1
+            if ($hit) { return $hit.PSChildName }
+        }
+    } catch { }
+    return '16.0'
+}
+
 # =====================================================================================
 #region CONFIG  -- single source of truth (edit values here, nowhere else)
 # =====================================================================================
 
-$Script:OfficeVer = '16.0'   # Office major version used in registry paths
+$Script:OfficeVer = Get-OfficeVersion   # auto-detected Office major version for registry paths
 
 $Script:Config = [ordered]@{
     Root          = 'C:\Temp\LaptopTransferBackups'                       # local working folder
@@ -60,6 +82,8 @@ $Script:Paths = [ordered]@{
     Trees              = Join-Path $Script:Config.Root 'Trees'
     ComputerInfo       = Join-Path $Script:Config.Root 'ComputerInfo.json'
     AppList            = Join-Path $Script:Config.Root 'InstalledApps.json'
+    Bookmarks          = Join-Path $Script:Config.Root 'BrowserBookmarks'
+    Manifest           = Join-Path $Script:Config.Root 'manifest.json'
 }
 
 # Registry keys (reg.exe form for export/import; PS-provider form for Test-Path)
@@ -70,7 +94,11 @@ $Script:Reg = @{
     WallpaperPS    = 'HKCU:\Control Panel\Desktop'
 }
 
-$Script:OneNoteSchema = 'http://schemas.microsoft.com/office/onenote/2013/onenote'
+# Browsers whose Bookmarks file we capture/restore (profiles discovered at runtime).
+$Script:Browsers = @(
+    @{ Name = 'Edge';   Base = 'Microsoft\Edge\User Data'; Process = 'msedge' }
+    @{ Name = 'Chrome'; Base = 'Google\Chrome\User Data';  Process = 'chrome' }
+)
 
 # Installed-app inventory map (Application -> install path / wildcard to probe)
 $Script:AppMap = [ordered]@{
@@ -166,11 +194,6 @@ function Stop-SwapLog {
 function Set-ConsoleUtf8 {
     # Lets the Unicode checklist marks render. Guarded: harmless if the host refuses.
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
-}
-
-function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function New-DirIfMissing {
@@ -367,14 +390,11 @@ function Clear-StaleWorkingFolder {
 function Get-OneNoteApp {
     if ($Script:OneNoteApp) { return $Script:OneNoteApp }
     try {
-        $interop = Get-ChildItem "$env:WINDIR\assembly\GAC_MSIL\Microsoft.Office.Interop.OneNote" `
-                   -Recurse -Filter '*.dll' -ErrorAction Stop | Select-Object -First 1
-        if (-not $interop) { throw 'OneNote Interop assembly not found in the GAC.' }
-        try { Add-Type -LiteralPath $interop.FullName -ErrorAction Stop } catch { }  # ignore "already loaded"
-        $Script:OneNoteApp = New-Object Microsoft.Office.Interop.OneNote.ApplicationClass
+        # Late-bound COM: no GAC interop assembly, no version-specific type names to break on.
+        $Script:OneNoteApp = New-Object -ComObject OneNote.Application
         return $Script:OneNoteApp
     } catch {
-        Write-Log "Unable to create OneNote COM object: $($_.Exception.Message)" ERROR
+        Write-Log "Unable to create OneNote COM object (is OneNote installed and opened once?): $($_.Exception.Message)" ERROR
         return $null
     }
 }
@@ -384,12 +404,12 @@ function Get-OneNoteNotebookList {
     if (-not $app) { return @() }
     try {
         $xml = ''
-        $app.GetHierarchy($null, [Microsoft.Office.Interop.OneNote.HierarchyScope]::hsNotebooks, [ref]$xml)
+        # 4 = hsPages: returns the full hierarchy; we only read the Notebook nodes out of it.
+        $app.GetHierarchy([string]::Empty, 4, [ref]$xml) | Out-Null
         $doc = New-Object System.Xml.XmlDocument
         $doc.LoadXml($xml)
-        $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
-        $ns.AddNamespace('one', $Script:OneNoteSchema)
-        $doc.SelectNodes('//one:Notebook', $ns) | ForEach-Object {
+        # local-name() ignores the schema-version namespace, so this works on any Office build.
+        $doc.SelectNodes("//*[local-name()='Notebook']") | ForEach-Object {
             [PSCustomObject]@{ Name = $_.GetAttribute('name'); Path = $_.GetAttribute('path') }
         }
     } catch {
@@ -563,6 +583,57 @@ function Backup-Wallpaper {
     Write-Log 'No wallpaper file found to back up.' WARN; return $false
 }
 
+function Backup-BrowserBookmark {
+    # Copy the Bookmarks JSON (and .bak) for every Edge/Chrome profile that has one.
+    $root  = $Script:Paths.Bookmarks
+    $count = 0
+    $names = @()
+    foreach ($b in $Script:Browsers) {
+        $userData = Join-Path $env:LOCALAPPDATA $b.Base
+        if (-not (Test-Path -LiteralPath $userData)) { continue }
+        $names += $b.Name
+        $profiles = @(Get-ChildItem $userData -Directory -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+        foreach ($p in $profiles) {
+            $bm = Join-Path $p.FullName 'Bookmarks'
+            if (-not (Test-Path -LiteralPath $bm)) { continue }
+            $dst = Join-Path $root (Join-Path $b.Name $p.Name)
+            New-DirIfMissing $dst
+            Copy-Item -LiteralPath $bm -Destination $dst -Force
+            if (Test-Path -LiteralPath "$bm.bak") { Copy-Item -LiteralPath "$bm.bak" -Destination $dst -Force }
+            $count++
+        }
+    }
+    if ($count -eq 0) { Write-Log 'No Edge/Chrome bookmarks found.' WARN; return $false }
+    Write-Log ("Backed up bookmarks: {0} profile(s) from {1}" -f $count, ($names -join ', ')) OK
+    return $true
+}
+
+function Restore-BrowserBookmark {
+    $root = $Script:Paths.Bookmarks
+    if (-not (Test-Path -LiteralPath $root)) { Write-Log 'No bookmarks in backup.' WARN; return $false }
+    $count = 0
+    foreach ($b in $Script:Browsers) {
+        $src = Join-Path $root $b.Name
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        if (Get-Process -Name $b.Process -ErrorAction SilentlyContinue) {
+            Write-Log "$($b.Name) is running - close it so restored bookmarks are not overwritten." WARN
+        }
+        $userData = Join-Path $env:LOCALAPPDATA $b.Base
+        foreach ($pd in (Get-ChildItem $src -Directory -ErrorAction SilentlyContinue)) {
+            $bm = Join-Path $pd.FullName 'Bookmarks'
+            if (-not (Test-Path -LiteralPath $bm)) { continue }
+            $dst = Join-Path $userData $pd.Name
+            New-DirIfMissing $dst
+            Copy-Item -LiteralPath $bm -Destination $dst -Force
+            $count++
+        }
+    }
+    if ($count -eq 0) { Write-Log 'No matching browser profiles to restore into.' WARN; return $false }
+    Write-Log ("Restored bookmarks into {0} profile(s)." -f $count) OK
+    return $true
+}
+
 #endregion
 
 # =====================================================================================
@@ -614,6 +685,25 @@ function Save-FolderTree {
 #region STORAGE / TRANSPORT  (OneDrive + F: unified via -Target)
 # =====================================================================================
 
+function Write-BackupManifest {
+    # A readable record of the run that travels inside the backup (Restore shows it as
+    # provenance; it also doubles as a second source of truth for the sanity check).
+    $manifest = [ordered]@{
+        Tool       = 'ALDI Laptop Swap'
+        Version    = 'v21'
+        User       = $env:USERNAME
+        Computer   = $env:COMPUTERNAME
+        Model      = (Get-CimInstance Win32_ComputerSystem).Model
+        ServiceTag = (Get-CimInstance Win32_BIOS).SerialNumber
+        OfficeVer  = $Script:OfficeVer
+        CreatedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + 'Z'
+        Steps      = @($Script:Steps | ForEach-Object { [ordered]@{ Step = $_.Step; Status = $_.Status; Detail = $_.Detail } })
+    }
+    Write-JsonFile -Object $manifest -Path $Script:Paths.Manifest
+    Write-Log "Manifest written -> $($Script:Paths.Manifest)" OK
+    return $true
+}
+
 function Save-Backup {
     param([Parameter(Mandatory)][ValidateSet('OneDrive','FDrive')][string]$Target)
     $root = $Script:Config.Root
@@ -637,36 +727,69 @@ function Save-Backup {
     }
 }
 
-function Get-Backup {
-    param([Parameter(Mandatory)][ValidateSet('OneDrive','FDrive')][string]$Target)
-    $root = $Script:Config.Root
-    New-DirIfMissing $root
+function Select-RestoreBackup {
+    # Build ONE list of available backups (F: first, then OneDrive newest-first), let the tech
+    # pick (Enter / 0 = default = newest F: else newest OneDrive), and stage it into the working
+    # folder. Also offers files already sitting in C:\Temp for an offline restore.
+    # Returns the staged working-folder path, or $null if nothing was selected.
+    $root    = $Script:Config.Root
+    $entries = New-Object System.Collections.Generic.List[object]
 
-    switch ($Target) {
-        'OneDrive' {
-            $base = Test-OneDriveReady
-            if (-not $base) { Write-Log 'OneDrive unavailable.' ERROR; return $false }
-            $backups = Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
-                       Where-Object Name -match '^Backup_\d{8}_\d{6}$' | Sort-Object Name -Descending
-            if (-not $backups) { Write-Log "No OneDrive backups in $base." ERROR; return $false }
-            $pick = Select-FromList -Items $backups -Display { param($b) $b.Name } -Prompt 'Select a backup (Enter = latest)'
-            if (-not $pick) { return $false }
-            $inner = Join-Path $pick.FullName 'LaptopTransferBackups'
-            $src   = if (Test-Path -LiteralPath $inner) { $inner } else { $pick.FullName }
-            Write-Log "Restoring from $src" INFO
-            return (Invoke-Robocopy -Source $src -Destination $root)
-        }
-        'FDrive' {
-            $base = Resolve-FDrive
-            if (-not $base) { Write-Log 'F: share unavailable.' ERROR; return $false }
-            $folder = Join-Path $base "Backup_$env:USERNAME"
-            if (-not (Test-Path -LiteralPath $folder)) { Write-Log "No F: backup for $env:USERNAME at $folder." ERROR; return $false }
-            $inner = Join-Path $folder 'LaptopTransferBackups'
-            $src   = if (Test-Path -LiteralPath $inner) { $inner } else { $folder }
-            Write-Log "Restoring from $src" INFO
-            return (Invoke-Robocopy -Source $src -Destination $root)
+    $fd = Resolve-FDrive
+    if ($fd) {
+        $fb = Join-Path $fd "Backup_$env:USERNAME"
+        if (Test-Path -LiteralPath $fb) {
+            $entries.Add([pscustomobject]@{ Source = 'F: drive'; Path = $fb; Date = (Get-Item $fb).LastWriteTime })
         }
     }
+    $od = Resolve-OneDrive
+    if ($od) {
+        Get-ChildItem $od -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^Backup_\d{8}_\d{6}$' } | Sort-Object Name -Descending |
+            ForEach-Object { $entries.Add([pscustomobject]@{ Source = 'OneDrive'; Path = $_.FullName; Date = $_.LastWriteTime }) }
+    }
+
+    $tempHasData = (Test-Path -LiteralPath $root) -and
+                   (@(Get-ChildItem $root -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'Logs' }).Count -gt 0)
+
+    if ($entries.Count -eq 0 -and -not $tempHasData) {
+        Write-Log 'No backups found on F: or OneDrive, and the local Temp folder is empty.' ERROR
+        Write-Log "Offline option: download a backup from $($Script:Config.SharePointUrl) into $root, then retry." INFO
+        return $null
+    }
+
+    Write-Host ''
+    Write-Host '  Available backups:' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $entries.Count; $i++) {
+        $e   = $entries[$i]
+        $def = if ($i -eq 0) { '   <- default' } else { '' }
+        Write-Host ("    {0}. {1,-9}  {2:yyyy-MM-dd HH:mm}  {3}{4}" -f $i, $e.Source, $e.Date, (Split-Path $e.Path -Leaf), $def)
+    }
+    if ($tempHasData) { Write-Host '    T. Use files already staged in C:\Temp (offline restore)' }
+
+    if ($Script:Unattended) { $sel = '0' }
+    else { $sel = (Read-Host '  Select a backup (Enter = default)').Trim().ToUpper() }
+
+    if ($sel -eq 'T' -and $tempHasData) { Write-Log "Using files already staged in $root (offline restore)." INFO; return $root }
+    if ($sel -eq '') { $sel = '0' }
+
+    if ($entries.Count -eq 0) {
+        if ($tempHasData) { return $root }
+        return $null
+    }
+    if (-not ($sel -match '^\d+$') -or [int]$sel -ge $entries.Count) {
+        if ($tempHasData) { Write-Log 'Invalid choice - using locally staged files.' WARN; return $root }
+        Write-Log 'Invalid choice.' ERROR; return $null
+    }
+
+    $pick = $entries[[int]$sel]
+    # Some backups nest their content under a 'LaptopTransferBackups' subfolder - unwrap it.
+    $inner = Join-Path $pick.Path 'LaptopTransferBackups'
+    $src   = if (Test-Path -LiteralPath $inner) { $inner } else { $pick.Path }
+    Write-Log "Staging backup from $($pick.Source): $src" INFO
+    New-DirIfMissing $root
+    if (Invoke-Robocopy -Source $src -Destination $root) { return $root }
+    return $null
 }
 
 #endregion
@@ -719,21 +842,36 @@ function Invoke-SwapStep {
 }
 
 function Show-Preflight {
-    # Pre-run summary of the environment; returns $true if the tech confirms.
+    # Quiet when healthy (per design): prints a one-line OK and proceeds. Only flashes a
+    # checklist when something is wrong, and only hard-stops a backup that has nowhere to go.
     param([Parameter(Mandatory)][string]$Mode)
     $od = Resolve-OneDrive
     $fd = Resolve-FDrive
-    $admin = Test-Admin
+    $issues = New-Object System.Collections.Generic.List[string]
+
+    if ($Mode -like 'BACKUP*') {
+        if (-not $od -and -not $fd) { $issues.Add('No backup target: OneDrive not signed in AND no F: drive present.') }
+        elseif (-not $od)           { $issues.Add('OneDrive not signed in - backup will go to the F: drive only.') }
+        $c = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+        if ($c -and (($c.FreeSpace / 1GB) -lt 5)) { $issues.Add(('Low free space on C: ({0} GB) - large Downloads may not zip.' -f [math]::Round($c.FreeSpace/1GB,1))) }
+    }
+
+    if ($issues.Count -eq 0) {
+        Write-Host ("  Pre-flight OK   Office {0} | OneDrive: {1} | F: {2}" -f `
+            $Script:OfficeVer, $(if ($od) { 'yes' } else { 'no' }), $(if ($fd) { 'yes' } else { 'n/a' })) -ForegroundColor Green
+        return $true
+    }
+
     Write-Host ''
     Write-Host "----------------- PRE-FLIGHT ($Mode) -----------------" -ForegroundColor Cyan
-    Write-Host ("   User            : {0}" -f $env:USERNAME)
-    Write-Host ("   Computer        : {0}" -f $env:COMPUTERNAME)
-    Write-Host ("   Admin rights    : {0}" -f $(if ($admin) { 'Yes' } else { 'NO - registry steps may fail' })) -ForegroundColor $(if ($admin) { 'Gray' } else { 'Yellow' })
-    Write-Host ("   Office version  : {0}" -f $Script:OfficeVer)
-    Write-Host ("   OneDrive        : {0}" -f $(if ($od) { $od } else { 'NOT found / not signed in' })) -ForegroundColor $(if ($od) { 'Gray' } else { 'Yellow' })
-    Write-Host ("   F: backup share : {0}" -f $(if ($fd) { $fd } else { 'not present (non-divisional laptop)' }))
-    Write-Host ("   Working folder  : {0}" -f $Script:Config.Root)
+    foreach ($i in $issues) { Write-Host "   ! $i" -ForegroundColor Yellow; Write-Log "Preflight: $i" WARN }
     Write-Host '------------------------------------------------------' -ForegroundColor Cyan
+
+    if ($Mode -like 'BACKUP*' -and -not $od -and -not $fd) {
+        $launcher = Join-Path $env:LOCALAPPDATA 'Microsoft\OneDrive\OneDrive.exe'
+        if ((Test-Path -LiteralPath $launcher) -and (Confirm-Action 'Try to launch OneDrive now?' $true)) { Start-Process $launcher }
+        return (Confirm-Action 'No backup target available yet. Continue anyway?' $false)
+    }
     return (Confirm-Action "Proceed with $Mode?" $true)
 }
 
@@ -775,7 +913,10 @@ function Invoke-Pipeline {
     $Script:StepTotal = $Steps.Count
     $Script:RunStart  = Get-Date
     foreach ($s in $Steps) {
-        Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $s.Verify -Optional:([bool]$s.Optional)
+        # Verify/Optional are optional keys; access via ContainsKey so StrictMode stays happy.
+        $verify   = if ($s.ContainsKey('Verify'))   { $s.Verify }        else { $null }
+        $optional = if ($s.ContainsKey('Optional')) { [bool]$s.Optional } else { $false }
+        Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $verify -Optional:$optional
     }
     Show-Checklist -Title $Title
 }
@@ -797,8 +938,10 @@ function Start-SwapBackup {
             @{ Name='Quick Access';          Action={ Backup-QuickAccess };                         Verify={ $n=@(Get-ChildItem $Script:Paths.QuickAccess -File -ErrorAction SilentlyContinue).Count; if ($n -gt 0) { "$n files" } else { $false } } }
             @{ Name='Downloads';             Action={ Backup-Downloads }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Downloads -Filter *.zip -ErrorAction SilentlyContinue).Count -gt 0 } }
             @{ Name='Wallpaper';             Action={ Backup-Wallpaper }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Wallpaper -File -ErrorAction SilentlyContinue).Count -gt 0 } }
+            @{ Name='Browser bookmarks';     Action={ Backup-BrowserBookmark }; Optional=$true;     Verify={ Test-Path $Script:Paths.Bookmarks } }
             @{ Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
             @{ Name='App inventory';         Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
+            @{ Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
             @{ Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive }; Optional=$true }
             @{ Name='Push to F: drive';      Action={ Save-Backup -Target FDrive };   Optional=$true }
         )
@@ -807,42 +950,33 @@ function Start-SwapBackup {
 }
 
 function Start-SwapRestore {
-    param(
-        [ValidateSet('OneDrive','FDrive','Offline')][string]$Source = 'OneDrive',
-        [bool]$IncludeOutlook = $true
-    )
     Set-ConsoleUtf8
-    if (-not (Show-Preflight -Mode "RESTORE ($Source)")) { Write-Log 'Restore cancelled by user.' WARN; return }
+    if (-not (Show-Preflight -Mode 'RESTORE')) { Write-Log 'Restore cancelled by user.' WARN; return }
     New-DirIfMissing $Script:Config.Root
     Start-SwapLog
     try {
+        # Let the tech choose which backup to restore (F: / OneDrive / offline), then stage it.
+        $staged = Select-RestoreBackup
+        if (-not $staged) { Write-Log 'Restore cancelled - no backup selected.' WARN; return }
+
+        # If the backup carries a manifest, show where it came from (guard props for StrictMode).
+        $mf = Read-JsonFile $Script:Paths.Manifest
+        if ($mf -and ($mf.PSObject.Properties.Name -contains 'Computer')) {
+            Write-Log ("Restoring backup from {0} ({1}) created {2}" -f $mf.Computer, $mf.User, $mf.CreatedUtc) INFO
+        }
+
         $steps = New-Object System.Collections.Generic.List[object]
-
-        if ($IncludeOutlook) {
-            $steps.Add(@{ Name='Launch Outlook (first run)'; Optional=$true;
-                          Action={ $exe = Resolve-OutlookExe; if ($exe) { Start-Process $exe } else { 'SKIP' } } })
-        }
-
-        switch ($Source) {
-            'OneDrive' { $steps.Add(@{ Name='Fetch backup (OneDrive)'; Action={ Get-Backup -Target OneDrive }; Verify={ @(Get-ChildItem $Script:Config.Root -ErrorAction SilentlyContinue).Count -gt 0 } }) }
-            'FDrive'   { $steps.Add(@{ Name='Fetch backup (F: drive)'; Action={ Get-Backup -Target FDrive };   Verify={ @(Get-ChildItem $Script:Config.Root -ErrorAction SilentlyContinue).Count -gt 0 } }) }
-            'Offline'  { $steps.Add(@{ Name='Stage offline files'; Action={
-                            Write-Log "Offline restore: put the backup files under $($Script:Config.Root) (structure: <Root>\*files*)." WARN
-                            Write-Log "Download from $($Script:Config.SharePointUrl) if needed." INFO
-                            if (-not $Script:Unattended) { Read-Host 'Press Enter once the files are in place' | Out-Null }
-                         } }) }
-        }
-
-        $steps.Add(@{ Name='Restore signatures';   Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
-        $steps.Add(@{ Name='Restore Quick Access'; Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
-        $steps.Add(@{ Name='OneNote shortcuts';    Action={ New-OneNoteShortcuts }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
-        $steps.Add(@{ Name='Compare notebooks';    Action={ Compare-OneNoteNotebook } })
-        $steps.Add(@{ Name='Import OneNote reg';   Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
-
-        if ($IncludeOutlook) {
-            $steps.Add(@{ Name='Wait for Outlook profile'; Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
-            $steps.Add(@{ Name='Import Outlook profile';   Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
-        }
+        # Launch Outlook early so it can build its profile while the other steps run.
+        $steps.Add(@{ Name='Launch Outlook (first run)'; Optional=$true;
+                      Action={ $exe = Resolve-OutlookExe; if ($exe) { Start-Process $exe } else { 'SKIP' } } })
+        $steps.Add(@{ Name='Restore signatures';        Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
+        $steps.Add(@{ Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
+        $steps.Add(@{ Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
+        $steps.Add(@{ Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
+        $steps.Add(@{ Name='Compare notebooks';         Action={ Compare-OneNoteNotebook } })
+        $steps.Add(@{ Name='Import OneNote reg';        Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
+        $steps.Add(@{ Name='Wait for Outlook profile';  Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
+        $steps.Add(@{ Name='Import Outlook profile';    Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
 
         Invoke-Pipeline -Steps $steps.ToArray() -Title 'RESTORE SUMMARY'
     } finally { Stop-SwapLog }
@@ -856,23 +990,17 @@ function Start-SwapRestore {
 
 function Show-Menu {
     $items = [ordered]@{
-        '1' = @{ Group = 'Backup';  Text = 'Full Backup';                        Action = { Start-SwapBackup } }
-        '2' = @{ Group = 'Restore'; Text = 'Restore from OneDrive';              Action = { Start-SwapRestore -Source OneDrive -IncludeOutlook $true } }
-        '3' = @{ Group = 'Restore'; Text = 'Restore from F: drive';              Action = { Start-SwapRestore -Source FDrive  -IncludeOutlook $true } }
-        '4' = @{ Group = 'Restore'; Text = 'Restore from OneDrive (no Outlook)'; Action = { Start-SwapRestore -Source OneDrive -IncludeOutlook $false } }
-        '5' = @{ Group = 'Restore'; Text = 'Offline Restore (manual files)';     Action = { Start-SwapRestore -Source Offline -IncludeOutlook $false } }
-        '6' = @{ Group = 'Tools';   Text = 'Repair Outlook profile';             Action = { Repair-OutlookProfile } }
-        '7' = @{ Group = 'Tools';   Text = 'Show installed apps';                Action = { Get-InstalledAppList } }
-        '8' = @{ Group = 'Tools';   Text = 'Check OneDrive connection';          Action = { $od = Resolve-OneDrive; if ($od) { Write-Log "OneDrive OK: $od" OK } else { Write-Log 'OneDrive not found / not signed in.' WARN } } }
+        '1' = @{ Group = 'Backup';  Text = 'Full Backup';                Action = { Start-SwapBackup } }
+        '2' = @{ Group = 'Restore'; Text = 'Restore (choose a backup)';  Action = { Start-SwapRestore } }
+        '3' = @{ Group = 'Tools';   Text = 'Repair Outlook profile';     Action = { Repair-OutlookProfile } }
+        '4' = @{ Group = 'Tools';   Text = 'Show installed apps';        Action = { Get-InstalledAppList } }
+        '5' = @{ Group = 'Tools';   Text = 'Check OneDrive connection';  Action = { $od = Resolve-OneDrive; if ($od) { Write-Log "OneDrive OK: $od" OK } else { Write-Log 'OneDrive not found / not signed in.' WARN } } }
     }
 
     while ($true) {
         Clear-Host
-        $admin = Test-Admin
-        $badge = if ($admin) { '[ADMIN]' } else { '[NOT ADMIN]' }
         Write-Host '==================== ALDI LAPTOP SWAP (v21) ====================' -ForegroundColor Cyan
-        Write-Host ("  {0}  on  {1}    {2}" -f $env:USERNAME, $env:COMPUTERNAME, $badge) -ForegroundColor $(if ($admin) { 'Green' } else { 'Yellow' })
-        if (-not $admin) { Write-Host '  (registry import/export may fail without admin rights)' -ForegroundColor Yellow }
+        Write-Host ("   {0}  on  {1}     Office {2}" -f $env:USERNAME, $env:COMPUTERNAME, $Script:OfficeVer) -ForegroundColor Gray
 
         $lastGroup = $null
         foreach ($k in $items.Keys) {
