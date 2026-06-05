@@ -195,6 +195,8 @@ $Script:OneNoteApp  = $null
 # Cached connectivity/health + backup counts (populated by Update-HealthStatus)
 $Script:Health       = $null
 $Script:BackupCounts = @{ F = 0; O = 0; T = 0 }
+$Script:RunInfo      = @{}     # destinations / source captured during a run, for the summary card
+$Script:BoxWidth     = 61      # inner width of the framed UI boxes
 
 # Sanity-check / progress state (populated per pipeline run)
 $Script:Steps       = New-Object System.Collections.Generic.List[object]
@@ -521,6 +523,15 @@ function Write-HealthItem {
     Write-Host ("  {0} {1}" -f $mark, $Label) -NoNewline -ForegroundColor $col
 }
 
+function Write-BoxRule { param([string]$Ch = '=', [ConsoleColor]$Color = 'Cyan') Write-Host ('  +' + ($Ch * $Script:BoxWidth) + '+') -ForegroundColor $Color }
+function Write-BoxRow {
+    param([string]$Text, [ConsoleColor]$Color = 'White')
+    if ($Text.Length -gt $Script:BoxWidth - 2) { $Text = $Text.Substring(0, $Script:BoxWidth - 2) }
+    Write-Host '  |' -NoNewline -ForegroundColor Cyan
+    Write-Host (' ' + $Text.PadRight($Script:BoxWidth - 1)) -NoNewline -ForegroundColor $Color
+    Write-Host '|' -ForegroundColor Cyan
+}
+
 function Show-AppHeader {
     param([string]$Subtitle = '')
     Set-ConsoleUtf8
@@ -529,13 +540,13 @@ function Show-AppHeader {
     $c = $Script:BackupCounts
 
     Write-Host ''
-    Write-Host '  ===============================================================' -ForegroundColor Cyan
-    Write-Host '   ALDI LAPTOP SWAP TOOLKIT      v21' -ForegroundColor White
-    Write-Host ("   {0} on {1}      Office {2}" -f $env:USERNAME, $env:COMPUTERNAME, $Script:OfficeVer) -ForegroundColor DarkGray
-    if ($Subtitle) { Write-Host ("   >> {0}" -f $Subtitle) -ForegroundColor Cyan }
-    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+    Write-BoxRule '='
+    Write-BoxRow 'ALDI LAPTOP SWAP TOOLKIT      v21' 'White'
+    Write-BoxRow ("{0} on {1}      Office {2}" -f $env:USERNAME, $env:COMPUTERNAME, $Script:OfficeVer) 'Gray'
+    if ($Subtitle) { Write-BoxRow (">> $Subtitle") 'Cyan' }
+    Write-BoxRule '='
 
-    # Health strip (each pill coloured independently). A present OneDrive *folder* is not enough -
+    # Health strip below the box (coloured pills). A present OneDrive *folder* is not enough -
     # OneDrive.exe must be running or nothing syncs, so that state shows RED.
     $odOk    = $h.OneDriveFound -and $h.OneDriveRunning
     $odState = if ($odOk) { 'ok' } else { 'bad' }
@@ -547,16 +558,14 @@ function Show-AppHeader {
     $npState = if ($h.CorpReachable) { 'ok' } else { 'bad' }
     $npLabel = if ($h.CorpReachable) { 'Network reachable' } else { 'Network unreachable' }
 
-    Write-Host '   Health ' -NoNewline -ForegroundColor Gray
+    Write-Host '   Health' -NoNewline -ForegroundColor Gray
     Write-HealthItem $odState $odLabel
     Write-HealthItem $fdState $fdLabel
     Write-HealthItem $npState $npLabel
     Write-Host ''
-
-    # Backup counts (item #2)
     Write-Host ("   Backups found: {0} Fdrive, {1} Onedrive, {2} temp" -f $c.F, $c.O, $c.T) -NoNewline -ForegroundColor White
-    Write-Host ("    checked {0:HH:mm:ss}" -f $h.CheckedAt) -ForegroundColor DarkGray
-    Write-Host '  ===============================================================' -ForegroundColor Cyan
+    Write-Host ("     {0:HH:mm:ss}" -f $h.CheckedAt) -ForegroundColor DarkGray
+    Write-Host ('  ' + ('-' * ($Script:BoxWidth + 2))) -ForegroundColor DarkCyan
 }
 
 function Show-HealthDetail {
@@ -642,6 +651,7 @@ function Export-OneNoteRegistry {
 }
 
 function New-OneNoteShortcuts {
+    param([switch]$OpenFolder)   # on restore, pop the folder open so the tech can click the shortcuts
     $json = Read-JsonFile $Script:Paths.OneNoteJson
     if (-not $json) { Write-Log 'No notebook list to build shortcuts from.' WARN; return }
     $dir = $Script:Paths.OneNoteShortcuts
@@ -666,6 +676,10 @@ function New-OneNoteShortcuts {
         }
     }
     Write-Log "Created $count OneNote shortcut(s) in $dir" OK
+    if ($OpenFolder -and (Test-Path -LiteralPath $dir)) {
+        try { Invoke-Item $dir } catch { Write-Log "Could not open shortcuts folder: $($_.Exception.Message)" WARN }
+    }
+    return $true
 }
 
 function Import-OneNoteRegistry {
@@ -1023,6 +1037,7 @@ function Save-Backup {
                 Write-Log 'No network connectivity - OneDrive cannot upload this backup right now.' ERROR
                 return $false   # offline = upload will not happen -> RED
             }
+            $Script:RunInfo['OneDrive'] = $dest
             Write-Log 'OneDrive backup staged and syncing.' OK
             return $true
         }
@@ -1035,6 +1050,7 @@ function Save-Backup {
             # exclude bulky/irrelevant dirs on the network share (proper /XD, fixes old -like bug)
             if (-not (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups') `
                     -Options @('/E','/COPY:DAT','/R:1','/W:1','/NP','/NFL','/NDL','/XD', $Script:Paths.Downloads, $Script:Paths.Wallpaper))) { return $false }
+            $Script:RunInfo['FDrive'] = $dest
             Write-Log "F: backup written to $dest" OK
             return $true
         }
@@ -1084,7 +1100,7 @@ function Select-RestoreBackup {
     if ($Script:Unattended) { $sel = '0' }
     else { $sel = (Read-Host '  Select a backup (Enter = default)').Trim().ToUpper() }
 
-    if ($sel -eq 'T' -and $tempHasData) { Write-Log "Using files already staged in $root (offline restore)." INFO; return $root }
+    if ($sel -eq 'T' -and $tempHasData) { Write-Log "Using files already staged in $root (offline restore)." INFO; $Script:RunInfo['RestoredFrom'] = "$root  (offline / already staged)"; return $root }
     if ($sel -eq '') { $sel = '0' }
 
     if ($entries.Count -eq 0) {
@@ -1102,7 +1118,10 @@ function Select-RestoreBackup {
     $src   = if (Test-Path -LiteralPath $inner) { $inner } else { $pick.Path }
     Write-Log "Staging backup from $($pick.Source): $src" INFO
     New-DirIfMissing $root
-    if (Invoke-Robocopy -Source $src -Destination $root) { return $root }
+    if (Invoke-Robocopy -Source $src -Destination $root) {
+        $Script:RunInfo['RestoredFrom'] = "{0}  ({1})" -f $pick.Path, $pick.Source
+        return $root
+    }
     return $null
 }
 
@@ -1121,7 +1140,8 @@ function Invoke-SwapStep {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][scriptblock]$Action,
         [scriptblock]$Verify,
-        [switch]$Optional
+        [switch]$Optional,
+        [string]$Phase = 'General'
     )
     $Script:StepIndex++
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1147,11 +1167,12 @@ function Invoke-SwapStep {
 
     $sw.Stop()
     $Script:Steps.Add([pscustomobject]@{
-        Step = $Name; Status = $status; Detail = $detail; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        Num = $Script:StepIndex; Step = $Name; Status = $status; Detail = $detail
+        Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Phase = $Phase
     })
 
-    $line = "   {0} {1}" -f $Script:Marks[$status], $Name
-    if ($detail) { $line += " ($detail)" }
+    $line = "   [{0,2}/{1}]  {2}  {3}" -f $Script:StepIndex, $Script:StepTotal, $Script:Marks[$status], $Name
+    if ($detail) { $line += "  $detail" }
     Write-Host $line -ForegroundColor $Script:MarkColor[$status]
 }
 
@@ -1201,14 +1222,23 @@ function Show-Checklist {
     $total = $Script:Steps.Count
 
     Write-Host ''
-    Write-Host ("  ==============  {0}  ==============" -f $Title) -ForegroundColor Cyan
-    foreach ($s in $Script:Steps) {
-        Write-Host ("   {0}  {1,-26}" -f $Script:Marks[$s.Status], $s.Step) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status]
-        if ($s.Detail) { Write-Host (" {0}" -f $s.Detail) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status] }
-        Write-Host ("  [{0}s]" -f $s.Seconds) -ForegroundColor DarkGray
-    }
-    Write-Host ('  ' + ('-' * 60)) -ForegroundColor DarkGray
+    Write-BoxRule '='
+    Write-BoxRow $Title 'White'
+    Write-BoxRule '='
 
+    # Group steps by phase, preserving first-seen order; each step keeps its global [n/total].
+    $phases = New-Object System.Collections.Generic.List[string]
+    foreach ($s in $Script:Steps) { if (-not $phases.Contains($s.Phase)) { $phases.Add($s.Phase) } }
+    foreach ($ph in $phases) {
+        if ($ph -ne 'General') { Write-Host ("   {0}" -f $ph.ToUpper()) -ForegroundColor DarkCyan }
+        foreach ($s in ($Script:Steps | Where-Object { $_.Phase -eq $ph })) {
+            Write-Host ("    [{0,2}/{1}]  {2}  {3,-24}" -f $s.Num, $total, $Script:Marks[$s.Status], $s.Step) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status]
+            if ($s.Detail) { Write-Host (" {0}" -f $s.Detail) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status] }
+            Write-Host ("  [{0}s]" -f $s.Seconds) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-BoxRule '-' 'DarkGray'
     # Headline - green only when nothing failed and nothing warned.
     $headColor = if ($fail) { 'Red' } elseif ($warn) { 'Yellow' } else { 'Green' }
     Write-Host ("   RESULT:  {0} / {1} passed     ({2} warn, {3} failed, {4} skipped)     Elapsed {5:mm\:ss}" -f `
@@ -1224,9 +1254,27 @@ function Show-Checklist {
             if ($f.Detail) { Write-Host ("         {0}" -f $f.Detail) -ForegroundColor DarkGray }
         }
     }
+    Write-BoxRule '='
+}
 
-    if ($Script:LogFile) { Write-Host ''; Write-Host ("   Log: {0}" -f $Script:LogFile) -ForegroundColor DarkGray }
-    Write-Host ('  ' + ('=' * 60)) -ForegroundColor Cyan
+function Show-SummaryCard {
+    # Boxed end-of-run card: where the data actually went + log + elapsed.
+    param([Parameter(Mandatory)][ValidateSet('Backup','Restore')][string]$Mode)
+    $elapsed = if ($Script:RunStart) { (Get-Date) - $Script:RunStart } else { [TimeSpan]::Zero }
+    Write-Host ''
+    Write-BoxRule '-' 'Cyan'
+    Write-BoxRow ("{0} complete" -f $Mode) 'White'
+    Write-BoxRule '-' 'Cyan'
+    if ($Mode -eq 'Backup') {
+        Write-Host ("   OneDrive : {0}" -f $(if ($Script:RunInfo.ContainsKey('OneDrive')) { $Script:RunInfo['OneDrive'] } else { '(not synced)' })) -ForegroundColor Gray
+        Write-Host ("   F: drive : {0}" -f $(if ($Script:RunInfo.ContainsKey('FDrive'))   { $Script:RunInfo['FDrive'] }   else { '(not written)' })) -ForegroundColor Gray
+        Write-Host ("   Temp     : {0}" -f $Script:Config.Root) -ForegroundColor Gray
+    } else {
+        Write-Host ("   Restored from : {0}" -f $(if ($Script:RunInfo.ContainsKey('RestoredFrom')) { $Script:RunInfo['RestoredFrom'] } else { $Script:Config.Root })) -ForegroundColor Gray
+    }
+    if ($Script:LogFile) { Write-Host ("   Log      : {0}" -f $Script:LogFile) -ForegroundColor Gray }
+    Write-Host ("   Elapsed  : {0:n1}s" -f $elapsed.TotalSeconds) -ForegroundColor Gray
+    Write-BoxRule '-' 'Cyan'
 }
 
 function Invoke-Pipeline {
@@ -1238,10 +1286,11 @@ function Invoke-Pipeline {
     $Script:StepTotal = $Steps.Count
     $Script:RunStart  = Get-Date
     foreach ($s in $Steps) {
-        # Verify/Optional are optional keys; access via ContainsKey so StrictMode stays happy.
+        # Verify/Optional/Phase are optional keys; access via ContainsKey so StrictMode stays happy.
         $verify   = if ($s.ContainsKey('Verify'))   { $s.Verify }        else { $null }
         $optional = if ($s.ContainsKey('Optional')) { [bool]$s.Optional } else { $false }
-        Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $verify -Optional:$optional
+        $phase    = if ($s.ContainsKey('Phase'))    { [string]$s.Phase }  else { 'General' }
+        Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $verify -Optional:$optional -Phase $phase
     }
     Show-Checklist -Title $Title
 }
@@ -1255,27 +1304,29 @@ function Start-SwapBackup {
     Clear-StaleWorkingFolder
     New-DirIfMissing $Script:Config.Root
     Reset-ReportFlags
+    $Script:RunInfo = @{}
     Start-SwapLog
     try {
         $steps = @(
-            @{ Name='Device summary';        Action={ Get-DeviceSummary };                          Verify={ Test-Path $Script:Paths.ComputerInfo } }
-            @{ Name='Email signatures';      Action={ Sync-Signature -Direction Backup }; Optional=$true; Verify={ "$(@(Get-ChildItem $Script:Paths.Signatures -Recurse -File -ErrorAction SilentlyContinue).Count) files" } }
-            @{ Name='OneNote notebook list'; Action={ Export-OneNoteNotebooks };                    Verify={ $j=Read-JsonFile $Script:Paths.OneNoteJson; if ($j) { "$(@($j).Count) notebooks" } else { $false } } }
-            @{ Name='Local-notebook check';  Action={ Find-LocalNotebook } }
-            @{ Name='OneNote shortcuts';     Action={ New-OneNoteShortcuts }; Optional=$true;       Verify={ Test-Path $Script:Paths.OneNoteShortcuts } }
-            @{ Name='OneNote registry';      Action={ Export-OneNoteRegistry };                     Verify={ Test-Path $Script:Paths.OneNoteReg } }
-            @{ Name='Outlook profile';       Action={ Export-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path (Join-Path $Script:Paths.OutlookRegDir 'OldPcOutlook.reg') } }
-            @{ Name='Quick Access';          Action={ Backup-QuickAccess };                         Verify={ $n=@(Get-ChildItem $Script:Paths.QuickAccess -File -ErrorAction SilentlyContinue).Count; if ($n -gt 0) { "$n files" } else { $false } } }
-            @{ Name='Downloads';             Action={ Backup-Downloads }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Downloads -Filter *.zip -ErrorAction SilentlyContinue).Count -gt 0 } }
-            @{ Name='Wallpaper';             Action={ Backup-Wallpaper }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Wallpaper -File -ErrorAction SilentlyContinue).Count -gt 0 } }
-            @{ Name='Browser bookmarks';     Action={ Backup-BrowserBookmark }; Optional=$true;     Verify={ Test-Path $Script:Paths.Bookmarks } }
-            @{ Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
-            @{ Name='Installed software';    Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
-            @{ Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
-            @{ Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive } }
-            @{ Name='Push to F: drive';      Action={ Save-Backup -Target FDrive } }
+            @{ Phase='Capture';   Name='Device summary';        Action={ Get-DeviceSummary };                          Verify={ Test-Path $Script:Paths.ComputerInfo } }
+            @{ Phase='Capture';   Name='Email signatures';      Action={ Sync-Signature -Direction Backup }; Optional=$true; Verify={ "$(@(Get-ChildItem $Script:Paths.Signatures -Recurse -File -ErrorAction SilentlyContinue).Count) files" } }
+            @{ Phase='Capture';   Name='OneNote notebook list'; Action={ Export-OneNoteNotebooks };                    Verify={ $j=Read-JsonFile $Script:Paths.OneNoteJson; if ($j) { "$(@($j).Count) notebooks" } else { $false } } }
+            @{ Phase='Capture';   Name='Local-notebook check';  Action={ Find-LocalNotebook } }
+            @{ Phase='Capture';   Name='OneNote shortcuts';     Action={ New-OneNoteShortcuts }; Optional=$true;       Verify={ Test-Path $Script:Paths.OneNoteShortcuts } }
+            @{ Phase='Capture';   Name='OneNote registry';      Action={ Export-OneNoteRegistry };                     Verify={ Test-Path $Script:Paths.OneNoteReg } }
+            @{ Phase='Capture';   Name='Outlook profile';       Action={ Export-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path (Join-Path $Script:Paths.OutlookRegDir 'OldPcOutlook.reg') } }
+            @{ Phase='Capture';   Name='Quick Access';          Action={ Backup-QuickAccess };                         Verify={ $n=@(Get-ChildItem $Script:Paths.QuickAccess -File -ErrorAction SilentlyContinue).Count; if ($n -gt 0) { "$n files" } else { $false } } }
+            @{ Phase='Capture';   Name='Downloads';             Action={ Backup-Downloads }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Downloads -Filter *.zip -ErrorAction SilentlyContinue).Count -gt 0 } }
+            @{ Phase='Capture';   Name='Wallpaper';             Action={ Backup-Wallpaper }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Wallpaper -File -ErrorAction SilentlyContinue).Count -gt 0 } }
+            @{ Phase='Capture';   Name='Browser bookmarks';     Action={ Backup-BrowserBookmark }; Optional=$true;     Verify={ Test-Path $Script:Paths.Bookmarks } }
+            @{ Phase='Capture';   Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
+            @{ Phase='Capture';   Name='Installed software';    Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
+            @{ Phase='Transport'; Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
+            @{ Phase='Transport'; Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive } }
+            @{ Phase='Transport'; Name='Push to F: drive';      Action={ Save-Backup -Target FDrive } }
         )
-        Invoke-Pipeline -Steps $steps -Title 'BACKUP SUMMARY'
+        Invoke-Pipeline -Steps $steps -Title 'BACKUP SANITY CHECK'
+        Show-SummaryCard -Mode Backup
     } finally { Stop-SwapLog }
 }
 
@@ -1287,6 +1338,7 @@ function Start-SwapRestore {
     if (-not (Show-Preflight -Mode 'RESTORE')) { Write-Log 'Restore cancelled by user.' WARN; return }
     New-DirIfMissing $Script:Config.Root
     Reset-ReportFlags
+    $Script:RunInfo = @{}
     Start-SwapLog
     try {
         # Let the tech choose which backup to restore (F: / OneDrive / offline), then stage it.
@@ -1301,19 +1353,21 @@ function Start-SwapRestore {
 
         $steps = New-Object System.Collections.Generic.List[object]
         # Launch Outlook early so it can build its profile while the other steps run.
-        $steps.Add(@{ Name='Launch Outlook (first run)'; Optional=$true;
+        $steps.Add(@{ Phase='Restore'; Name='Launch Outlook (first run)'; Optional=$true;
                       Action={ $exe = Resolve-OutlookExe; if ($exe) { Start-Process $exe } else { 'SKIP' } } })
-        $steps.Add(@{ Name='Restore signatures';        Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
-        $steps.Add(@{ Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
-        $steps.Add(@{ Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
-        $steps.Add(@{ Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
+        $steps.Add(@{ Phase='Restore'; Name='Restore signatures';        Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
+        $steps.Add(@{ Phase='Restore'; Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
+        $steps.Add(@{ Phase='Restore'; Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
+        # Build the OneNote shortcuts AND pop the folder open so the tech can click straight in.
+        $steps.Add(@{ Phase='Restore'; Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts -OpenFolder }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
         # Import the OpenNotebooks registry FIRST, then open OneNote and verify they reopened.
-        $steps.Add(@{ Name='Import OneNote reg';        Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
-        $steps.Add(@{ Name='Verify OneNote notebooks';  Action={ Test-OneNoteRestore } })
-        $steps.Add(@{ Name='Wait for Outlook profile';  Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
-        $steps.Add(@{ Name='Import Outlook profile';    Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
+        $steps.Add(@{ Phase='Profiles & verify'; Name='Import OneNote reg';       Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
+        $steps.Add(@{ Phase='Profiles & verify'; Name='Verify OneNote notebooks'; Action={ Test-OneNoteRestore } })
+        $steps.Add(@{ Phase='Profiles & verify'; Name='Wait for Outlook profile'; Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
+        $steps.Add(@{ Phase='Profiles & verify'; Name='Import Outlook profile';   Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
 
-        Invoke-Pipeline -Steps $steps.ToArray() -Title 'RESTORE SUMMARY'
+        Invoke-Pipeline -Steps $steps.ToArray() -Title 'RESTORE SANITY CHECK'
+        Show-SummaryCard -Mode Restore
     } finally { Stop-SwapLog }
 }
 
