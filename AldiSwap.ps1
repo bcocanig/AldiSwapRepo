@@ -98,10 +98,12 @@ $Script:Reg = @{
     WallpaperPS    = 'HKCU:\Control Panel\Desktop'
 }
 
-# Browsers whose Bookmarks file we capture/restore (profiles discovered at runtime).
+# Browsers whose Bookmarks file we capture (profiles discovered at runtime).
+# Restore = $false means we keep a backup copy but do NOT push it back - Edge already syncs its
+# bookmarks from the user's Microsoft profile, so re-pushing our copy is unnecessary/risky.
 $Script:Browsers = @(
-    @{ Name = 'Edge';   Base = 'Microsoft\Edge\User Data'; Process = 'msedge' }
-    @{ Name = 'Chrome'; Base = 'Google\Chrome\User Data';  Process = 'chrome' }
+    @{ Name = 'Edge';   Base = 'Microsoft\Edge\User Data'; Process = 'msedge'; Restore = $false }
+    @{ Name = 'Chrome'; Base = 'Google\Chrome\User Data';  Process = 'chrome'; Restore = $true  }
 )
 
 # Installed-software report: we enumerate every program from the registry uninstall keys and
@@ -373,9 +375,13 @@ function Import-RegKey {
 }
 
 function Write-JsonFile {
-    param([Parameter(Mandatory)]$Object, [Parameter(Mandatory)][string]$Path, [int]$Depth = 5)
+    # $Object is intentionally NOT mandatory: a null/empty result (e.g. zero OneNote notebooks)
+    # should still write a valid file rather than throw a parameter-binding error.
+    param($Object, [Parameter(Mandatory)][string]$Path, [int]$Depth = 5)
     New-DirIfMissing (Split-Path $Path -Parent)
-    $Object | ConvertTo-Json -Depth $Depth | Set-Content -Path $Path -Encoding UTF8
+    $json = $Object | ConvertTo-Json -Depth $Depth
+    if ($null -eq $json) { $json = '[]' }
+    Set-Content -Path $Path -Value $json -Encoding UTF8
 }
 
 function Read-JsonFile {
@@ -629,9 +635,10 @@ function Get-OneNoteNotebookList {
         $doc = New-Object System.Xml.XmlDocument
         $doc.LoadXml($xml)
         # local-name() ignores the schema-version namespace, so this works on any Office build.
-        $doc.SelectNodes("//*[local-name()='Notebook']") | ForEach-Object {
+        $nb = $doc.SelectNodes("//*[local-name()='Notebook']") | ForEach-Object {
             [PSCustomObject]@{ Name = $_.GetAttribute('name'); Path = $_.GetAttribute('path') }
         }
+        return ,@($nb)   # always an array, even for 0 or 1 notebook (prevents null-bind downstream)
     } catch {
         Write-Log "Failed to read OneNote hierarchy: $($_.Exception.Message)" ERROR
         return @()
@@ -688,26 +695,60 @@ function Import-OneNoteRegistry {
     Import-RegKey -RegFile $Script:Paths.OneNoteReg
 }
 
-function Test-NotebookIsCloud {
-    # Cloud notebooks (SharePoint/OneDrive) reopen automatically from the restored registry.
-    # Anything else (a C:\ path or a UNC share) is LOCAL and will NOT migrate during a swap.
+function Get-NotebookLocation {
+    # Classify a OneNote notebook path into one of three buckets:
+    #   OneDrive   - the user's OneDrive / OneDrive-for-Business (migrates fine)
+    #   SharePoint - a team SharePoint site (migrates fine)
+    #   Other      - a local C:\ path or a shared/mapped drive (will NOT migrate - a problem)
     param([string]$Path)
-    if (-not $Path) { return $false }
-    return ($Path -match '^https?://')
+    if (-not $Path) { return 'Other' }
+    if ($Path -match '-my\.sharepoint\.com' -or $Path -match 'd\.docs\.live\.net') { return 'OneDrive' }
+    if ($Path -match '\.sharepoint\.com') { return 'SharePoint' }
+    if ($Path -match '^https?://')        { return 'SharePoint' }   # some other cloud share
+    return 'Other'
+}
+
+function Show-NotebookTable {
+    # Readable, colour-coded table of every notebook + where it lives. Shown during the run so
+    # the tech can immediately spot notebooks that are local/shared (red) and won't migrate.
+    param([System.Collections.IEnumerable]$Notebooks)
+    $list = @($Notebooks)
+    Write-Host ''
+    Write-Host ("  OneNote notebooks ({0})" -f $list.Count) -ForegroundColor Cyan
+    Write-Host ('  ' + ('-' * ($Script:BoxWidth + 2))) -ForegroundColor DarkCyan
+    Write-Host ("   {0,-12} {1,-30} {2}" -f 'Location', 'Notebook', 'Path') -ForegroundColor Gray
+    $od = 0; $sp = 0; $ot = 0
+    foreach ($nb in $list) {
+        $loc = Get-NotebookLocation $nb.Path
+        switch ($loc) {
+            'OneDrive'   { $col = 'Green'; $tag = 'OneDrive';   $od++ }
+            'SharePoint' { $col = 'Cyan';  $tag = 'SharePoint'; $sp++ }
+            default      { $col = 'Red';   $tag = 'Other (!)';  $ot++ }
+        }
+        $nm = if ($nb.Name) { [string]$nb.Name } else { '(unnamed)' }
+        if ($nm.Length -gt 29) { $nm = $nm.Substring(0, 27) + '..' }
+        Write-Host ("   {0,-12} {1,-30} {2}" -f $tag, $nm, $nb.Path) -ForegroundColor $col
+    }
+    Write-Host ('  ' + ('-' * ($Script:BoxWidth + 2))) -ForegroundColor DarkCyan
+    Write-Host ("   OneDrive: {0}    SharePoint: {1}    Other: {2}    (total {3})" -f $od, $sp, $ot, $list.Count) -ForegroundColor White
+    if ($ot -gt 0) { Write-Host ("   ! {0} notebook(s) are LOCAL or on a shared drive and will NOT migrate." -f $ot) -ForegroundColor Red }
 }
 
 function Find-LocalNotebook {
-    # BACKUP-side check (#9): flag any captured notebook that isn't on SharePoint/OneDrive, so the
-    # tech knows those won't come across the swap and must be handled by hand.
+    # BACKUP-side: show the notebook table (name / location / path + counts) live so the tech can
+    # see it, and flag any notebook on a local C:\ or shared drive ('Other') - those won't migrate.
     $list = @(Read-JsonFile $Script:Paths.OneNoteJson)
-    if (-not $list -or $list.Count -eq 0) { Write-Log 'No notebook list to inspect.' INFO; return $true }
-    $local = @($list | Where-Object { -not (Test-NotebookIsCloud $_.Path) })
-    if ($local.Count -eq 0) { Write-Log 'All notebooks are cloud (SharePoint/OneDrive).' OK; return $true }
-    foreach ($nb in $local) {
-        Add-ReportFlag -Level Warn -Title ("LOCAL notebook (won't migrate): {0}" -f $nb.Name) -Detail $nb.Path
-        Write-Log (" - local notebook: {0} [{1}]" -f $nb.Name, $nb.Path) WARN
+    if (-not $list -or $list.Count -eq 0) { Write-Log 'No notebooks captured to inspect.' WARN; return $true }
+
+    Show-NotebookTable -Notebooks $list
+
+    $other = @($list | Where-Object { (Get-NotebookLocation $_.Path) -eq 'Other' })
+    foreach ($nb in $other) {
+        Add-ReportFlag -Level Warn -Title ("Notebook NOT in OneDrive/SharePoint: {0}" -f $nb.Name) -Detail $nb.Path
+        Write-Log (" - local/shared notebook: {0} [{1}]" -f $nb.Name, $nb.Path) WARN
     }
-    return 'WARN'
+    if ($other.Count -gt 0) { return 'WARN' }
+    return $true
 }
 
 function Test-OneNoteRestore {
@@ -742,7 +783,7 @@ function Test-OneNoteRestore {
     }
     Write-Host ''
 
-    Write-JsonFile -Object (Get-OneNoteNotebookList) -Path $Script:Paths.OneNoteCompareJson
+    Write-JsonFile -Object @(Get-OneNoteNotebookList) -Path $Script:Paths.OneNoteCompareJson
     $missing = @($expected | Where-Object { $present -notcontains $_.Name })
     if ($missing.Count -eq 0) { Write-Log ("All {0} notebook(s) restored." -f $expected.Count) OK; return $true }
 
@@ -883,6 +924,7 @@ function Restore-BrowserBookmark {
     if (-not (Test-Path -LiteralPath $root)) { Write-Log 'No bookmarks in backup.' WARN; return $false }
     $count = 0
     foreach ($b in $Script:Browsers) {
+        if (-not $b.Restore) { Write-Log "$($b.Name): backup kept, but not restored (it syncs from the Microsoft profile)." INFO; continue }
         $src = Join-Path $root $b.Name
         if (-not (Test-Path -LiteralPath $src)) { continue }
         if (Get-Process -Name $b.Process -ErrorAction SilentlyContinue) {
@@ -1025,8 +1067,10 @@ function Save-Backup {
 
     switch ($Target) {
         'OneDrive' {
-            $base = Test-OneDriveReady
-            if (-not $base) { Write-Log 'OneDrive folder not found - cannot back up to OneDrive.' ERROR; return $false }
+            # Resolve (don't Test-OneDriveReady) so a backup on a box without OneDrive fails fast
+            # instead of waiting ~5 min for a sign-in that will never come. Pre-flight already warned.
+            $base = Resolve-OneDrive
+            if (-not $base) { Write-Log 'OneDrive not found / not signed in - cannot back up to OneDrive.' ERROR; return $false }
             $dest = Join-Path $base ("Backup_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
             if (-not (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups'))) { return $false }
 
@@ -1105,7 +1149,7 @@ function Select-RestoreBackup {
     if ($Script:Unattended) { $sel = '0' }
     else { $sel = (Read-Host '  Select a backup (Enter = default)').Trim().ToUpper() }
 
-    if ($sel -eq 'T' -and $tempHasData) { Write-Log "Using files already staged in $root (offline restore)." INFO; $Script:RunInfo['RestoredFrom'] = "$root  (offline / already staged)"; return $root }
+    if ($sel -eq 'T' -and $tempHasData) { Write-Log "Using files already staged in $root (offline restore)." INFO; $Script:RunInfo['RestoredFrom'] = "$root  (offline / already staged)"; $Script:RunInfo['SourceType'] = 'Temp'; return $root }
     if ($sel -eq '') { $sel = '0' }
 
     if ($entries.Count -eq 0) {
@@ -1125,9 +1169,35 @@ function Select-RestoreBackup {
     New-DirIfMissing $root
     if (Invoke-Robocopy -Source $src -Destination $root) {
         $Script:RunInfo['RestoredFrom'] = "{0}  ({1})" -f $pick.Path, $pick.Source
+        $Script:RunInfo['SourceType']   = $pick.Source   # 'F: drive' or 'OneDrive' - drives the F: cleanup step
+        $Script:RunInfo['SourcePath']   = $pick.Path
         return $root
     }
     return $null
+}
+
+function Remove-FDriveBackupAfterRestore {
+    # Step 10/10: once an F: drive restore finishes with ZERO failures, delete that F: backup so the
+    # share doesn't accumulate hundreds of old backups. The delete is COMMENTED OUT while testing -
+    # for now it just reports what it would remove.
+    $sourceType = if ($Script:RunInfo.ContainsKey('SourceType')) { [string]$Script:RunInfo['SourceType'] } else { '' }
+    if ($sourceType -ne 'F: drive') {
+        Write-Log "Restore source was '$sourceType', not the F: drive - no F: cleanup needed." INFO
+        return 'SKIP'
+    }
+    $fails = @($Script:Steps | Where-Object Status -eq 'Fail').Count
+    if ($fails -gt 0) {
+        Write-Log "Restore had $fails failure(s) - leaving the F: backup in place for safety." WARN
+        return 'WARN'
+    }
+    $fb = if ($Script:RunInfo.ContainsKey('SourcePath')) { [string]$Script:RunInfo['SourcePath'] } else { '' }
+    Write-Log 'F: restore completed with zero errors - the F: backup is safe to remove:' OK
+    Write-Log "   $fb" INFO
+    # --- DELETE DISABLED FOR TESTING --- uncomment the next two lines to actually clean up F::
+    # if ($fb -and (Test-Path -LiteralPath $fb)) { Remove-Item -LiteralPath $fb -Recurse -Force; Write-Log "Removed F: backup: $fb" OK }
+    # else { Write-Log "F: backup path not found: $fb" WARN }
+    Write-Log '(delete is commented out during testing - no files were removed)' INFO
+    return $true
 }
 
 #endregion
@@ -1320,11 +1390,11 @@ function Start-SwapBackup {
     try {
         $steps = @(
             @{ Phase='System info';     Name='Device summary';        Action={ Get-DeviceSummary -Quiet };                   Verify={ Test-Path $Script:Paths.ComputerInfo } }
-            @{ Phase='System info';     Name='Installed software';    Action={ Get-InstalledAppList -Quiet };                Verify={ Test-Path $Script:Paths.AppList } }
+            @{ Phase='System info';     Name='Installed software';    Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
             @{ Phase='Email & Outlook'; Name='Email signatures';      Action={ Sync-Signature -Direction Backup }; Optional=$true; Verify={ "$(@(Get-ChildItem $Script:Paths.Signatures -Recurse -File -ErrorAction SilentlyContinue).Count) files" } }
             @{ Phase='Email & Outlook'; Name='Outlook profile';       Action={ Export-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path (Join-Path $Script:Paths.OutlookRegDir 'OldPcOutlook.reg') } }
             @{ Phase='OneNote';         Name='OneNote notebook list'; Action={ Export-OneNoteNotebooks };                    Verify={ $j=Read-JsonFile $Script:Paths.OneNoteJson; if ($j) { "$(@($j).Count) notebooks" } else { $false } } }
-            @{ Phase='OneNote';         Name='Local-notebook check';  Action={ Find-LocalNotebook } }
+            @{ Phase='OneNote';         Name='OneNote locations';     Action={ Find-LocalNotebook } }
             @{ Phase='OneNote';         Name='OneNote shortcuts';     Action={ New-OneNoteShortcuts }; Optional=$true;       Verify={ Test-Path $Script:Paths.OneNoteShortcuts } }
             @{ Phase='OneNote';         Name='OneNote registry';      Action={ Export-OneNoteRegistry };                     Verify={ Test-Path $Script:Paths.OneNoteReg } }
             @{ Phase='User files';      Name='Quick Access';          Action={ Backup-QuickAccess };                         Verify={ $n=@(Get-ChildItem $Script:Paths.QuickAccess -File -ErrorAction SilentlyContinue).Count; if ($n -gt 0) { "$n files" } else { $false } } }
@@ -1369,16 +1439,21 @@ function Start-SwapRestore {
         $steps.Add(@{ Phase='Files & email'; Name='Restore signatures';        Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
         $steps.Add(@{ Phase='Files & email'; Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
         $steps.Add(@{ Phase='Files & email'; Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
-        # Build the OneNote shortcuts AND pop the folder open so the tech can click straight in.
-        $steps.Add(@{ Phase='OneNote'; Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts -OpenFolder }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
+        # Build the OneNote shortcuts (the folder is auto-opened at the END of the restore).
+        $steps.Add(@{ Phase='OneNote'; Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
         # Import the OpenNotebooks registry FIRST, then open OneNote and verify they reopened.
         $steps.Add(@{ Phase='OneNote'; Name='Import OneNote reg';        Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
         $steps.Add(@{ Phase='OneNote'; Name='Verify OneNote notebooks';  Action={ Test-OneNoteRestore } })
         $steps.Add(@{ Phase='Outlook profile'; Name='Wait for Outlook profile'; Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
         $steps.Add(@{ Phase='Outlook profile'; Name='Import Outlook profile';   Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
+        # Step 10/10: if we restored from F: with zero failures, remove that F: backup so the share
+        # doesn't accumulate hundreds of old backups. (The actual delete is COMMENTED OUT for testing.)
+        $steps.Add(@{ Phase='Cleanup'; Name='Remove F: backup (if clean)'; Action={ Remove-FDriveBackupAfterRestore } })
 
         Invoke-Pipeline -Steps $steps.ToArray() -Title 'RESTORE SANITY CHECK'
         Show-SummaryCard -Mode Restore
+        # On completion, pop open the OneNote shortcuts folder so the tech can click straight into them.
+        if (Test-Path -LiteralPath $Script:Paths.OneNoteShortcuts) { try { Invoke-Item $Script:Paths.OneNoteShortcuts } catch { } }
     } finally { Stop-SwapLog }
 }
 
