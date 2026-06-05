@@ -17,6 +17,8 @@
       * Every step wrapped: a failure logs and continues, never kills the session.
       * Late-bound OneNote COM + auto-detected Office version (no fragile GAC/2013 schema).
       * Edge/Chrome bookmarks captured; a readable manifest.json travels with each backup.
+      * Live health strip (OneDrive/F:/network), per-step progress, and a sanity dashboard.
+      * Flags local OneNote notebooks (won't migrate) and any that don't reopen on restore.
       * Approved verbs, StrictMode, UTF-8 everywhere, exit-code checks. No admin required.
 
 .NOTES
@@ -62,9 +64,11 @@ $Script:Config = [ordered]@{
     Root          = 'C:\Temp\LaptopTransferBackups'                       # local working folder
     FDriveRoot    = 'F:\usrnew\For IT Support\Laptop Swap Script\Backups' # divisional network backup
     SharePointUrl = 'https://asgportal-my.sharepoint.com/my'             # offline-restore download source
+    CorpHost      = '10.60.162.200'                                       # network reachability probe (DNS/server)
+    PingTimeoutMs = 1000                                                  # bounded so the health check never hangs
     # OneDrive folders are "OneDrive - <tenant>"; tried in this order (most specific first):
     OneDriveTenants = @('OneDrive - ALDI DX', 'OneDrive - ALDI-HOFER')
-    Processes     = @{ OneNote = 'onenote'; OneNoteSender = 'ONENOTEM'; Outlook = 'OUTLOOK'; Explorer = 'explorer' }
+    Processes     = @{ OneNote = 'onenote'; OneNoteSender = 'ONENOTEM'; Outlook = 'OUTLOOK'; Explorer = 'explorer'; OneDrive = 'OneDrive' }
 }
 
 # Derived sub-paths (built once from Root so nothing else hardcodes them)
@@ -130,11 +134,16 @@ $Script:LogFile     = $null
 $Script:TranscriptOn= $false
 $Script:OneNoteApp  = $null
 
+# Cached connectivity/health + backup counts (populated by Update-HealthStatus)
+$Script:Health       = $null
+$Script:BackupCounts = @{ F = 0; O = 0 }
+
 # Sanity-check / progress state (populated per pipeline run)
 $Script:Steps       = New-Object System.Collections.Generic.List[object]
 $Script:StepIndex   = 0
 $Script:StepTotal   = 0
 $Script:RunStart    = $null
+$Script:ReportFlags = New-Object System.Collections.Generic.List[object]  # end-of-run "Attention" items
 
 # Checklist marks (built from code points so the file stays pure-ASCII; avoids the
 # PS 5.1 "no BOM -> mojibake" trap that bit the old script's em dashes).
@@ -240,11 +249,20 @@ function Wait-ForCondition {
         [int]$PollSeconds = 2,
         [string]$Activity = 'Waiting'
     )
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $sw   = [System.Diagnostics.Stopwatch]::StartNew()
+    $spin = [char[]]'|/-\'
+    $i    = 0
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        if (& $Condition) { return $true }
+        if (& $Condition) {
+            if ($i -gt 0) { Write-Host ("`r   {0,-60}" -f "$Activity... done.") -ForegroundColor DarkGray }
+            return $true
+        }
+        $remain = [int]($TimeoutSeconds - $sw.Elapsed.TotalSeconds)
+        Write-Host ("`r   {0} {1}... {2,3}s left " -f $spin[$i % 4], $Activity, $remain) -NoNewline -ForegroundColor DarkGray
+        $i++
         Start-Sleep -Seconds $PollSeconds
     }
+    Write-Host ("`r   {0,-60}" -f "$Activity... timed out.")
     Write-Log "$Activity timed out after $TimeoutSeconds s." WARN
     return $false
 }
@@ -306,6 +324,20 @@ function Read-JsonFile {
     Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+function Reset-ReportFlags {
+    $Script:ReportFlags = New-Object System.Collections.Generic.List[object]
+}
+
+function Add-ReportFlag {
+    # Queue an item for the end-of-run "Attention" section (e.g. local notebooks, missing data).
+    param(
+        [ValidateSet('Warn','Error')][string]$Level = 'Warn',
+        [Parameter(Mandatory)][string]$Title,
+        [string]$Detail = ''
+    )
+    $Script:ReportFlags.Add([pscustomobject]@{ Level = $Level; Title = $Title; Detail = $Detail })
+}
+
 #endregion
 
 # =====================================================================================
@@ -361,6 +393,123 @@ function Test-OneDriveReady {
         return $od
     }
     return $null
+}
+
+#endregion
+
+# =====================================================================================
+#region CONNECTIVITY / HEALTH
+# =====================================================================================
+
+function Test-CorpNetwork {
+    # Fast, bounded reachability probe to the corp host (System.Net so it can't hang the UI).
+    try {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        return (($ping.Send($Script:Config.CorpHost, $Script:Config.PingTimeoutMs)).Status -eq 'Success')
+    } catch { return $false }
+}
+
+function Test-OneDriveRunning {
+    return [bool](Get-Process -Name $Script:Config.Processes.OneDrive -ErrorAction SilentlyContinue)
+}
+
+function Update-HealthStatus {
+    # Compute and CACHE health + backup counts so the menu header renders instantly without
+    # re-probing the network on every keypress. Called at startup, on [R]efresh, and per run.
+    # The F: probe is gated on network reachability so an offline box never hangs on a dead share.
+    $corp   = Test-CorpNetwork
+    $odPath = $null
+    try { $odPath = Resolve-OneDrive } catch { }            # local folder test, fast
+    $odRun  = Test-OneDriveRunning
+
+    $fdPath = $null
+    if ($corp) { try { $fdPath = Resolve-FDrive } catch { } }   # only touch the share when the network is up
+
+    $oCount = 0
+    if ($odPath) {
+        try { $oCount = @(Get-ChildItem $odPath -Directory -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -match '^Backup_\d{8}_\d{6}$' }).Count } catch { }
+    }
+    $fCount = 0
+    if ($fdPath) {
+        try { if (Test-Path -LiteralPath (Join-Path $fdPath "Backup_$env:USERNAME")) { $fCount = 1 } } catch { }
+    }
+
+    $Script:Health = [ordered]@{
+        OneDriveFound   = [bool]$odPath
+        OneDriveRunning = $odRun
+        OneDriveOnline  = ([bool]$odPath -and $odRun -and $corp)
+        FDriveOnline    = [bool]$fdPath
+        CorpReachable   = $corp
+        CheckedAt       = (Get-Date)
+    }
+    $Script:BackupCounts = @{ F = $fCount; O = $oCount }
+    return $Script:Health
+}
+
+function Get-HealthColor { param([bool]$Ok) if ($Ok) { 'Green' } else { 'Red' } }
+
+function Write-HealthItem {
+    # One coloured status pill on the health strip. State: ok (green check) / warn (yellow !) / bad (red X).
+    param([ValidateSet('ok','warn','bad')][string]$State, [string]$Label)
+    switch ($State) {
+        'ok'   { $mark = [char]0x2713; $col = 'Green'  }
+        'warn' { $mark = [char]0x0021; $col = 'Yellow' }
+        default{ $mark = [char]0x2717; $col = 'Red'    }
+    }
+    Write-Host ("  {0} {1}" -f $mark, $Label) -NoNewline -ForegroundColor $col
+}
+
+function Show-AppHeader {
+    param([string]$Subtitle = '')
+    Set-ConsoleUtf8
+    if (-not $Script:Health) { Update-HealthStatus | Out-Null }
+    $h = $Script:Health
+    $c = $Script:BackupCounts
+
+    Write-Host ''
+    Write-Host '  ===============================================================' -ForegroundColor Cyan
+    Write-Host '   ALDI LAPTOP SWAP TOOLKIT      v21' -ForegroundColor White
+    Write-Host ("   {0} on {1}      Office {2}" -f $env:USERNAME, $env:COMPUTERNAME, $Script:OfficeVer) -ForegroundColor DarkGray
+    if ($Subtitle) { Write-Host ("   >> {0}" -f $Subtitle) -ForegroundColor Cyan }
+    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+
+    # Health strip (each pill coloured independently)
+    $odState = if ($h.OneDriveOnline) { 'ok' } elseif ($h.OneDriveFound) { 'warn' } else { 'bad' }
+    $odLabel = if ($h.OneDriveOnline) { 'OneDrive online' }
+               elseif ($h.OneDriveFound -and -not $h.OneDriveRunning) { 'OneDrive NOT running' }
+               elseif ($h.OneDriveFound) { 'OneDrive offline' }
+               else { 'OneDrive missing' }
+    $fdState = if ($h.FDriveOnline) { 'ok' } else { 'bad' }
+    $fdLabel = if ($h.FDriveOnline) { 'F: online' } else { 'F: unreachable' }
+    $npState = if ($h.CorpReachable) { 'ok' } else { 'bad' }
+    $npLabel = "Net $($Script:Config.CorpHost)"
+
+    Write-Host '   Health ' -NoNewline -ForegroundColor Gray
+    Write-HealthItem $odState $odLabel
+    Write-HealthItem $fdState $fdLabel
+    Write-HealthItem $npState $npLabel
+    Write-Host ''
+
+    # Backup counts (the "1F 2O" at-a-glance, item #5)
+    Write-Host ("   Backups  {0}F  {1}O" -f $c.F, $c.O) -NoNewline -ForegroundColor White
+    Write-Host ("   (F:/OneDrive found for {0})   checked {1:HH:mm:ss}" -f $env:USERNAME, $h.CheckedAt) -ForegroundColor DarkGray
+    Write-Host '  ===============================================================' -ForegroundColor Cyan
+}
+
+function Show-HealthDetail {
+    # Verbose connectivity report for the Tools menu item.
+    Update-HealthStatus | Out-Null
+    $h = $Script:Health
+    Write-Host ''
+    Write-Host '  Connectivity / health check' -ForegroundColor Cyan
+    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+    Write-Host ('   OneDrive folder  : {0}' -f $(if ($h.OneDriveFound) { Resolve-OneDrive } else { 'NOT found / not signed in' })) -ForegroundColor (Get-HealthColor $h.OneDriveFound)
+    Write-Host ('   OneDrive.exe     : {0}' -f $(if ($h.OneDriveRunning) { 'running' } else { 'NOT running - files will not sync' })) -ForegroundColor (Get-HealthColor $h.OneDriveRunning)
+    Write-Host ('   Network {0,-14}: {1}' -f $Script:Config.CorpHost, $(if ($h.CorpReachable) { 'reachable' } else { 'no response' })) -ForegroundColor (Get-HealthColor $h.CorpReachable)
+    Write-Host ('   F: share         : {0}' -f $(if ($h.FDriveOnline) { Resolve-FDrive } else { 'unreachable' })) -ForegroundColor (Get-HealthColor $h.FDriveOnline)
+    Write-Host ('   Backups found    : {0} on F:, {1} on OneDrive' -f $Script:BackupCounts.F, $Script:BackupCounts.O) -ForegroundColor White
+    return $true
 }
 
 #endregion
@@ -463,27 +612,69 @@ function Import-OneNoteRegistry {
     Import-RegKey -RegFile $Script:Paths.OneNoteReg
 }
 
-function Compare-OneNoteNotebook {
-    $before = Read-JsonFile $Script:Paths.OneNoteJson
-    if (-not $before) { Write-Log 'No pre-swap notebook list to compare against.' WARN; return }
-    Write-Log 'Opening OneNote to re-check notebooks...' INFO
-    Start-Process 'onenote.exe' -ErrorAction SilentlyContinue
-    Wait-ForCondition -Condition { Get-Process -Name $Script:Config.Processes.OneNote -ErrorAction SilentlyContinue } `
-                      -TimeoutSeconds 60 -PollSeconds 2 -Activity 'OneNote start' | Out-Null
-    Start-Sleep -Seconds 5   # brief settle: OneNote enumerates notebooks asynchronously after launch
-    $after   = @(Export-OneNoteNotebooks -OutFile $Script:Paths.OneNoteCompareJson)
-    $missing = Compare-Object -ReferenceObject @($before.Name) -DifferenceObject @($after.Name) |
-               Where-Object SideIndicator -eq '<=' | ForEach-Object InputObject
-    if ($missing) {
-        Write-Log 'Notebooks present before but MISSING after restore:' WARN
-        foreach ($m in $missing) {
-            $o = $before | Where-Object Name -eq $m
-            Write-Log " - $($o.Name)  [$($o.Path)]" WARN
-        }
-        return 'WARN'
+function Test-NotebookIsCloud {
+    # Cloud notebooks (SharePoint/OneDrive) reopen automatically from the restored registry.
+    # Anything else (a C:\ path or a UNC share) is LOCAL and will NOT migrate during a swap.
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    return ($Path -match '^https?://')
+}
+
+function Find-LocalNotebook {
+    # BACKUP-side check (#9): flag any captured notebook that isn't on SharePoint/OneDrive, so the
+    # tech knows those won't come across the swap and must be handled by hand.
+    $list = @(Read-JsonFile $Script:Paths.OneNoteJson)
+    if (-not $list -or $list.Count -eq 0) { Write-Log 'No notebook list to inspect.' INFO; return $true }
+    $local = @($list | Where-Object { -not (Test-NotebookIsCloud $_.Path) })
+    if ($local.Count -eq 0) { Write-Log 'All notebooks are cloud (SharePoint/OneDrive).' OK; return $true }
+    foreach ($nb in $local) {
+        Add-ReportFlag -Level Warn -Title ("LOCAL notebook (won't migrate): {0}" -f $nb.Name) -Detail $nb.Path
+        Write-Log (" - local notebook: {0} [{1}]" -f $nb.Name, $nb.Path) WARN
     }
-    Write-Log 'All notebooks present.' OK
-    return $true
+    return 'WARN'
+}
+
+function Test-OneNoteRestore {
+    # RESTORE-side check (#7): after importing the OpenNotebooks registry, open OneNote and let the
+    # backed-up notebooks reopen, then report any that did NOT come back. Robust replacement for the
+    # old fixed-Start-Sleep compare: polls until the live list stops growing (or every expected
+    # notebook is present), so slow OneNote sync no longer produces false "missing" warnings.
+    $expected = @(Read-JsonFile $Script:Paths.OneNoteJson)
+    if (-not $expected -or $expected.Count -eq 0) { Write-Log 'No backed-up notebook list to verify against.' WARN; return 'WARN' }
+
+    if (-not (Get-Process -Name $Script:Config.Processes.OneNote -ErrorAction SilentlyContinue)) {
+        Start-Process 'onenote.exe' -ErrorAction SilentlyContinue
+    }
+    Wait-ForCondition -Condition { Get-Process -Name $Script:Config.Processes.OneNote -ErrorAction SilentlyContinue } `
+                      -TimeoutSeconds 60 -PollSeconds 2 -Activity 'Opening OneNote' | Out-Null
+
+    $expectedNames = @($expected | ForEach-Object { $_.Name })
+    $deadline  = (Get-Date).AddSeconds(180)   # notebooks re-sync over time on a fresh PC
+    $present   = @()
+    $lastCount = -1
+    $stableFor = 0
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 5
+        $present    = @(Get-OneNoteNotebookList | ForEach-Object { $_.Name })
+        $missingNow = @($expectedNames | Where-Object { $present -notcontains $_ })
+        Write-Host ("`r   Waiting for notebooks to sync... {0}/{1} back   " -f ($expectedNames.Count - $missingNow.Count), $expectedNames.Count) -NoNewline -ForegroundColor DarkGray
+        if ($missingNow.Count -eq 0) { break }
+        if ($present.Count -eq $lastCount) { $stableFor++ } else { $stableFor = 0 }
+        $lastCount = $present.Count
+        if ($stableFor -ge 3) { break }   # list stable for ~15s -> stop waiting
+    }
+    Write-Host ''
+
+    Write-JsonFile -Object (Get-OneNoteNotebookList) -Path $Script:Paths.OneNoteCompareJson
+    $missing = @($expected | Where-Object { $present -notcontains $_.Name })
+    if ($missing.Count -eq 0) { Write-Log ("All {0} notebook(s) restored." -f $expected.Count) OK; return $true }
+
+    foreach ($nb in $missing) {
+        Add-ReportFlag -Level Warn -Title ("Notebook NOT restored: {0}" -f $nb.Name) -Detail $nb.Path
+        Write-Log (" - not restored: {0} [{1}]" -f $nb.Name, $nb.Path) WARN
+    }
+    return 'WARN'
 }
 
 #endregion
@@ -542,11 +733,13 @@ function Restore-QuickAccess {
     $src = $Script:Paths.QuickAccess
     if (-not (Test-Path -LiteralPath $src)) { Write-Log 'No Quick Access backup to restore.' WARN; return $false }
     $ok = Invoke-Robocopy -Source $src -Destination $dst -Options @('/E','/COPY:DAT','/IS','/R:1','/W:1','/NP','/NFL','/NDL')
-    Write-Log 'Restarting Explorer to refresh Quick Access...' INFO
-    Stop-ProcessSafe $Script:Config.Processes.Explorer | Out-Null
-    if (-not (Get-Process -Name $Script:Config.Processes.Explorer -ErrorAction SilentlyContinue)) {
-        Start-Process explorer.exe
-    }
+    # Explorer is the Windows shell and AUTO-RESTARTS the instant it's killed, so we must NOT
+    # wait for it to stay closed - that produced the bogus "Closing explorer timed out after 30s"
+    # warning even though Explorer was perfectly fine. Just bounce it and confirm one is back.
+    Write-Log 'Refreshing Explorer to pick up restored Quick Access...' INFO
+    Get-Process -Name $Script:Config.Processes.Explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    if (-not (Get-Process -Name $Script:Config.Processes.Explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
     return $ok
 }
 
@@ -661,13 +854,29 @@ function Get-DeviceSummary {
 function Get-InstalledAppList {
     $rows = foreach ($name in $Script:AppMap.Keys) {
         $hit = Get-Item -Path $Script:AppMap[$name] -ErrorAction SilentlyContinue | Select-Object -First 1
-        $installed = if ($hit) { 'Yes' } else { 'No' }
-        $path      = if ($hit) { $hit.FullName } else { '' }
-        [PSCustomObject]@{ Application = $name; Installed = $installed; Path = $path }
+        [PSCustomObject]@{
+            Application = $name
+            Installed   = [bool]$hit
+            Path        = if ($hit) { $hit.FullName } else { 'not found' }
+        }
     }
-    $rows | Where-Object Installed -eq 'Yes' | Format-Table -AutoSize | Out-Host
+
+    # Print a coloured table of EVERY tracked app to the terminal (green check = installed).
+    Write-Host ''
+    Write-Host '  Installed application report' -ForegroundColor Cyan
+    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+    foreach ($r in $rows) {
+        $mark = if ($r.Installed) { [char]0x2713 } else { [char]0x2717 }
+        $col  = if ($r.Installed) { 'Green' } else { 'DarkGray' }
+        Write-Host ("   {0}  {1,-26}  {2}" -f $mark, $r.Application, $r.Path) -ForegroundColor $col
+    }
+    $yes = @($rows | Where-Object Installed).Count
+    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+    Write-Host ("   {0} of {1} tracked apps installed" -f $yes, $rows.Count) -ForegroundColor White
+
     Write-JsonFile -Object $rows -Path $Script:Paths.AppList
     Write-Log "App inventory -> $($Script:Paths.AppList)" OK
+    return $true
 }
 
 function Save-FolderTree {
@@ -712,17 +921,34 @@ function Save-Backup {
     switch ($Target) {
         'OneDrive' {
             $base = Test-OneDriveReady
-            if (-not $base) { Write-Log 'OneDrive unavailable; skipping OneDrive backup.' WARN; return $false }
+            if (-not $base) { Write-Log 'OneDrive folder not found - cannot back up to OneDrive.' ERROR; return $false }
             $dest = Join-Path $base ("Backup_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-            return (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups'))
+            if (-not (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups'))) { return $false }
+
+            # The copy only landed in the LOCAL OneDrive folder - the real upload is OneDrive's
+            # background sync, so confirm it can actually happen (items #1 and #2).
+            if (-not (Test-OneDriveRunning)) {
+                Write-Log 'OneDrive.exe is not running - files are staged locally but will NOT sync until it starts.' WARN
+                return 'WARN'
+            }
+            if (-not (Test-CorpNetwork)) {
+                Write-Log 'No network connectivity - OneDrive cannot upload this backup right now.' ERROR
+                return $false   # offline = upload will not happen -> RED
+            }
+            Write-Log 'OneDrive backup staged and syncing.' OK
+            return $true
         }
         'FDrive' {
+            # F: is always mapped on these machines, so an unreachable F: is a genuine RED error
+            # (something is wrong with the machine, the network, or the VPN).
             $base = Resolve-FDrive
-            if (-not $base) { Write-Log 'F: share unavailable; skipping F: backup.' WARN; return $false }
+            if (-not $base) { Write-Log 'F: drive unreachable - check the network/VPN or the drive mapping.' ERROR; return $false }
             $dest = Join-Path $base "Backup_$env:USERNAME"
             # exclude bulky/irrelevant dirs on the network share (proper /XD, fixes old -like bug)
-            return (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups') `
-                    -Options @('/E','/COPY:DAT','/R:1','/W:1','/NP','/NFL','/NDL','/XD', $Script:Paths.Downloads, $Script:Paths.Wallpaper))
+            if (-not (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups') `
+                    -Options @('/E','/COPY:DAT','/R:1','/W:1','/NP','/NFL','/NDL','/XD', $Script:Paths.Downloads, $Script:Paths.Wallpaper))) { return $false }
+            Write-Log "F: backup written to $dest" OK
+            return $true
         }
     }
 }
@@ -884,24 +1110,35 @@ function Show-Checklist {
     $skip = @($Script:Steps | Where-Object Status -eq 'Skip').Count
     $warn = @($Script:Steps | Where-Object Status -eq 'Warn').Count
 
+    $total = $Script:Steps.Count
+
     Write-Host ''
-    Write-Host ("================= {0} =================" -f $Title) -ForegroundColor Cyan
+    Write-Host ("  ==============  {0}  ==============" -f $Title) -ForegroundColor Cyan
     foreach ($s in $Script:Steps) {
-        $line = "  {0}  {1}" -f $Script:Marks[$s.Status], $s.Step
-        if ($s.Detail) { $line += "  ($($s.Detail))" }
-        $line += "  [{0}s]" -f $s.Seconds
-        Write-Host $line -ForegroundColor $Script:MarkColor[$s.Status]
+        Write-Host ("   {0}  {1,-26}" -f $Script:Marks[$s.Status], $s.Step) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status]
+        if ($s.Detail) { Write-Host (" {0}" -f $s.Detail) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status] }
+        Write-Host ("  [{0}s]" -f $s.Seconds) -ForegroundColor DarkGray
     }
-    Write-Host ('-' * 54) -ForegroundColor DarkGray
-    $summary = "  {0} passed" -f $pass
-    if ($fail) { $summary += " - {0} failed"   -f $fail }
-    if ($warn) { $summary += " - {0} warnings" -f $warn }
-    if ($skip) { $summary += " - {0} skipped"  -f $skip }
-    $summary += "        Elapsed {0:mm\:ss}" -f $elapsed
-    $sumColor = if ($fail) { 'Red' } elseif ($warn) { 'Yellow' } else { 'Green' }
-    Write-Host $summary -ForegroundColor $sumColor
-    if ($Script:LogFile) { Write-Host ("  Log: {0}" -f $Script:LogFile) -ForegroundColor DarkGray }
-    Write-Host ('=' * (38 + $Title.Length)) -ForegroundColor Cyan
+    Write-Host ('  ' + ('-' * 60)) -ForegroundColor DarkGray
+
+    # Headline - green only when nothing failed and nothing warned.
+    $headColor = if ($fail) { 'Red' } elseif ($warn) { 'Yellow' } else { 'Green' }
+    Write-Host ("   RESULT:  {0} / {1} passed     ({2} warn, {3} failed, {4} skipped)     Elapsed {5:mm\:ss}" -f `
+        $pass, $total, $warn, $fail, $skip, $elapsed) -ForegroundColor $headColor
+
+    # Attention section - flagged local notebooks, notebooks that didn't restore, etc.
+    if ($Script:ReportFlags.Count -gt 0) {
+        Write-Host ''
+        Write-Host ("   !! ATTENTION - {0} item(s) need a human !!" -f $Script:ReportFlags.Count) -ForegroundColor Yellow
+        foreach ($f in $Script:ReportFlags) {
+            $col = if ($f.Level -eq 'Error') { 'Red' } else { 'Yellow' }
+            Write-Host ("     - {0}" -f $f.Title) -ForegroundColor $col
+            if ($f.Detail) { Write-Host ("         {0}" -f $f.Detail) -ForegroundColor DarkGray }
+        }
+    }
+
+    if ($Script:LogFile) { Write-Host ''; Write-Host ("   Log: {0}" -f $Script:LogFile) -ForegroundColor DarkGray }
+    Write-Host ('  ' + ('=' * 60)) -ForegroundColor Cyan
 }
 
 function Invoke-Pipeline {
@@ -912,26 +1149,35 @@ function Invoke-Pipeline {
     $Script:StepIndex = 0
     $Script:StepTotal = $Steps.Count
     $Script:RunStart  = Get-Date
+    $n = 0
     foreach ($s in $Steps) {
+        $n++
+        Write-Progress -Activity $Title -Status ("[{0}/{1}] {2}" -f $n, $Steps.Count, $s.Name) -PercentComplete ([int]((($n - 1) / $Steps.Count) * 100))
         # Verify/Optional are optional keys; access via ContainsKey so StrictMode stays happy.
         $verify   = if ($s.ContainsKey('Verify'))   { $s.Verify }        else { $null }
         $optional = if ($s.ContainsKey('Optional')) { [bool]$s.Optional } else { $false }
         Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $verify -Optional:$optional
     }
+    Write-Progress -Activity $Title -Completed
     Show-Checklist -Title $Title
 }
 
 function Start-SwapBackup {
     Set-ConsoleUtf8
+    Clear-Host
+    Update-HealthStatus | Out-Null
+    Show-AppHeader -Subtitle 'FULL BACKUP'
     if (-not (Show-Preflight -Mode 'BACKUP')) { Write-Log 'Backup cancelled by user.' WARN; return }
     Clear-StaleWorkingFolder
     New-DirIfMissing $Script:Config.Root
+    Reset-ReportFlags
     Start-SwapLog
     try {
         $steps = @(
             @{ Name='Device summary';        Action={ Get-DeviceSummary };                          Verify={ Test-Path $Script:Paths.ComputerInfo } }
             @{ Name='Email signatures';      Action={ Sync-Signature -Direction Backup }; Optional=$true; Verify={ "$(@(Get-ChildItem $Script:Paths.Signatures -Recurse -File -ErrorAction SilentlyContinue).Count) files" } }
             @{ Name='OneNote notebook list'; Action={ Export-OneNoteNotebooks };                    Verify={ $j=Read-JsonFile $Script:Paths.OneNoteJson; if ($j) { "$(@($j).Count) notebooks" } else { $false } } }
+            @{ Name='Local-notebook check';  Action={ Find-LocalNotebook } }
             @{ Name='OneNote shortcuts';     Action={ New-OneNoteShortcuts }; Optional=$true;       Verify={ Test-Path $Script:Paths.OneNoteShortcuts } }
             @{ Name='OneNote registry';      Action={ Export-OneNoteRegistry };                     Verify={ Test-Path $Script:Paths.OneNoteReg } }
             @{ Name='Outlook profile';       Action={ Export-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path (Join-Path $Script:Paths.OutlookRegDir 'OldPcOutlook.reg') } }
@@ -942,8 +1188,8 @@ function Start-SwapBackup {
             @{ Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
             @{ Name='App inventory';         Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
             @{ Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
-            @{ Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive }; Optional=$true }
-            @{ Name='Push to F: drive';      Action={ Save-Backup -Target FDrive };   Optional=$true }
+            @{ Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive } }
+            @{ Name='Push to F: drive';      Action={ Save-Backup -Target FDrive } }
         )
         Invoke-Pipeline -Steps $steps -Title 'BACKUP SUMMARY'
     } finally { Stop-SwapLog }
@@ -951,8 +1197,12 @@ function Start-SwapBackup {
 
 function Start-SwapRestore {
     Set-ConsoleUtf8
+    Clear-Host
+    Update-HealthStatus | Out-Null
+    Show-AppHeader -Subtitle 'RESTORE'
     if (-not (Show-Preflight -Mode 'RESTORE')) { Write-Log 'Restore cancelled by user.' WARN; return }
     New-DirIfMissing $Script:Config.Root
+    Reset-ReportFlags
     Start-SwapLog
     try {
         # Let the tech choose which backup to restore (F: / OneDrive / offline), then stage it.
@@ -973,8 +1223,9 @@ function Start-SwapRestore {
         $steps.Add(@{ Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
         $steps.Add(@{ Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
         $steps.Add(@{ Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
-        $steps.Add(@{ Name='Compare notebooks';         Action={ Compare-OneNoteNotebook } })
+        # Import the OpenNotebooks registry FIRST, then open OneNote and verify they reopened.
         $steps.Add(@{ Name='Import OneNote reg';        Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
+        $steps.Add(@{ Name='Verify OneNote notebooks';  Action={ Test-OneNoteRestore } })
         $steps.Add(@{ Name='Wait for Outlook profile';  Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
         $steps.Add(@{ Name='Import Outlook profile';    Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
 
@@ -989,19 +1240,18 @@ function Start-SwapRestore {
 # =====================================================================================
 
 function Show-Menu {
+    Update-HealthStatus | Out-Null
     $items = [ordered]@{
-        '1' = @{ Group = 'Backup';  Text = 'Full Backup';                Action = { Start-SwapBackup } }
-        '2' = @{ Group = 'Restore'; Text = 'Restore (choose a backup)';  Action = { Start-SwapRestore } }
-        '3' = @{ Group = 'Tools';   Text = 'Repair Outlook profile';     Action = { Repair-OutlookProfile } }
-        '4' = @{ Group = 'Tools';   Text = 'Show installed apps';        Action = { Get-InstalledAppList } }
-        '5' = @{ Group = 'Tools';   Text = 'Check OneDrive connection';  Action = { $od = Resolve-OneDrive; if ($od) { Write-Log "OneDrive OK: $od" OK } else { Write-Log 'OneDrive not found / not signed in.' WARN } } }
+        '1' = @{ Group = 'Backup';  Text = 'Full Backup';                 Action = { Start-SwapBackup } }
+        '2' = @{ Group = 'Restore'; Text = 'Restore (choose a backup)';   Action = { Start-SwapRestore } }
+        '3' = @{ Group = 'Tools';   Text = 'Repair Outlook profile';      Action = { Repair-OutlookProfile } }
+        '4' = @{ Group = 'Tools';   Text = 'Show installed apps';         Action = { Get-InstalledAppList } }
+        '5' = @{ Group = 'Tools';   Text = 'Connectivity / health check'; Action = { Show-HealthDetail } }
     }
 
     while ($true) {
         Clear-Host
-        Write-Host '==================== ALDI LAPTOP SWAP (v21) ====================' -ForegroundColor Cyan
-        Write-Host ("   {0}  on  {1}     Office {2}" -f $env:USERNAME, $env:COMPUTERNAME, $Script:OfficeVer) -ForegroundColor Gray
-
+        Show-AppHeader
         $lastGroup = $null
         foreach ($k in $items.Keys) {
             if ($items[$k].Group -ne $lastGroup) {
@@ -1012,11 +1262,12 @@ function Show-Menu {
             Write-Host ("    {0}. {1}" -f $k, $items[$k].Text)
         }
         Write-Host ''
-        Write-Host '    Q. Quit'
+        Write-Host '    R. Refresh status        Q. Quit' -ForegroundColor DarkGray
         Write-Host ''
 
         $sel = (Read-Host ' Select an option').Trim().ToUpper()
         if ($sel -eq 'Q') { break }
+        if ($sel -eq 'R') { Update-HealthStatus | Out-Null; continue }
         if ($items.Contains($sel)) {
             try { & $items[$sel].Action }
             catch { Write-Log "Action failed: $($_.Exception.Message)" ERROR }
