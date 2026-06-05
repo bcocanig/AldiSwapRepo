@@ -385,9 +385,14 @@ function Write-JsonFile {
 }
 
 function Read-JsonFile {
+    # Emit each top-level element so @(Read-JsonFile ...) flattens to a clean array. Returning
+    # ConvertFrom-Json's array directly makes @(...) NEST it as [ [items] ] - Where-Object/foreach
+    # then see one item (the inner array, with no .Path) and silently drop everything. That was the
+    # "No notebooks captured to inspect" bug despite a real notebook list.
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $data = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($item in @($data)) { $item }
 }
 
 function Reset-ReportFlags {
