@@ -718,29 +718,25 @@ function Get-NotebookLocation {
 }
 
 function Show-NotebookTable {
-    # Per-notebook "card" layout: colour-coded location tag + full name on one line, full path
-    # indented below. Long SharePoint/OneDrive URLs no longer wreck a fixed-column table, and
-    # local/shared notebooks (red) stand out for the tech.
+    # Real auto-sized, word-wrapping table (Location / Notebook / Path) shown live so the tech can
+    # see every notebook and spot any that are local/shared (won't migrate).
     param([System.Collections.IEnumerable]$Notebooks)
     $list = @($Notebooks)
-    $od = 0; $sp = 0; $ot = 0
-    Write-Host ''
-    Write-Host ("   OneNote notebooks  -  {0} found" -f $list.Count) -ForegroundColor Cyan
-    Write-Host ('   ' + ('-' * 64)) -ForegroundColor DarkCyan
-    $i = 0
-    foreach ($nb in $list) {
-        $i++
-        $loc = Get-NotebookLocation $nb.Path
-        switch ($loc) {
-            'OneDrive'   { $col = 'Green'; $tag = 'OneDrive';   $od++ }
-            'SharePoint' { $col = 'Cyan';  $tag = 'SharePoint'; $sp++ }
-            default      { $col = 'Red';   $tag = 'LOCAL!';     $ot++ }
-        }
-        $nm = if ($nb.Name) { [string]$nb.Name } else { '(unnamed)' }
-        Write-Host ("   {0,2}. [{1}]  {2}" -f $i, $tag.PadRight(10), $nm) -ForegroundColor $col
-        Write-Host ("        {0}" -f $nb.Path) -ForegroundColor DarkGray
+    $rows = foreach ($nb in $list) {
+        $p = if ($nb.PSObject.Properties.Name -contains 'Path') { [string]$nb.Path } else { '' }
+        $n = if (($nb.PSObject.Properties.Name -contains 'Name') -and $nb.Name) { [string]$nb.Name } else { '(unnamed)' }
+        [pscustomobject]@{ Location = (Get-NotebookLocation $p); Notebook = $n; Path = $p }
     }
-    Write-Host ('   ' + ('-' * 64)) -ForegroundColor DarkCyan
+    Write-Host ''
+    Write-Host ("  OneNote notebooks ({0})" -f $list.Count) -ForegroundColor Cyan
+
+    # Format-Table gives clean aligned columns and wraps long paths; indent each line by 2 spaces.
+    $table = ($rows | Format-Table -AutoSize -Wrap -Property Location, Notebook, Path | Out-String).TrimEnd("`r", "`n")
+    foreach ($ln in ($table -split "`r?`n")) { Write-Host ("  " + $ln) -ForegroundColor Gray }
+
+    $od = @($rows | Where-Object Location -eq 'OneDrive').Count
+    $sp = @($rows | Where-Object Location -eq 'SharePoint').Count
+    $ot = @($rows | Where-Object Location -eq 'Other').Count
     Write-Host ("   Total {0}    OneDrive {1}    SharePoint {2}    Other {3}" -f $list.Count, $od, $sp, $ot) -ForegroundColor White
     if ($ot -gt 0) { Write-Host ("   !  {0} notebook(s) are LOCAL or on a shared drive - they will NOT migrate." -f $ot) -ForegroundColor Red }
 }
@@ -933,29 +929,33 @@ function Backup-BrowserBookmark {
 }
 
 function Restore-BrowserBookmark {
+    # Only browsers flagged Restore=$true are pushed back (Edge is backup-only - it re-syncs from the
+    # Microsoft profile). If a browser isn't installed here, that's NOT an error - we just skip it.
+    # We only ever copy into profile folders that already exist; we never create a browser's folders.
     $root = $Script:Paths.Bookmarks
-    if (-not (Test-Path -LiteralPath $root)) { Write-Log 'No bookmarks in backup.' WARN; return $false }
-    $count = 0
+    if (-not (Test-Path -LiteralPath $root)) { Write-Log 'No bookmarks in this backup - skipping.' INFO; return 'SKIP' }
+    $restored = 0
     foreach ($b in $Script:Browsers) {
-        if (-not $b.Restore) { Write-Log "$($b.Name): backup kept, but not restored (it syncs from the Microsoft profile)." INFO; continue }
+        if (-not $b.Restore) { continue }   # backup-only browser (Edge)
+        $userData = Join-Path $env:LOCALAPPDATA $b.Base
+        if (-not (Test-Path -LiteralPath $userData)) { Write-Log "$($b.Name) not detected on this PC - skipping." INFO; continue }
         $src = Join-Path $root $b.Name
-        if (-not (Test-Path -LiteralPath $src)) { continue }
+        if (-not (Test-Path -LiteralPath $src)) { Write-Log "No $($b.Name) bookmarks in the backup - skipping." INFO; continue }
         if (Get-Process -Name $b.Process -ErrorAction SilentlyContinue) {
             Write-Log "$($b.Name) is running - close it so restored bookmarks are not overwritten." WARN
         }
-        $userData = Join-Path $env:LOCALAPPDATA $b.Base
         foreach ($pd in (Get-ChildItem $src -Directory -ErrorAction SilentlyContinue)) {
             $bm = Join-Path $pd.FullName 'Bookmarks'
             if (-not (Test-Path -LiteralPath $bm)) { continue }
             $dst = Join-Path $userData $pd.Name
-            New-DirIfMissing $dst
+            if (-not (Test-Path -LiteralPath $dst)) { Write-Log "$($b.Name) profile '$($pd.Name)' not present here - skipping that profile." INFO; continue }
             Copy-Item -LiteralPath $bm -Destination $dst -Force
-            $count++
+            $restored++
         }
     }
-    if ($count -eq 0) { Write-Log 'No matching browser profiles to restore into.' WARN; return $false }
-    Write-Log ("Restored bookmarks into {0} profile(s)." -f $count) OK
-    return $true
+    if ($restored -gt 0) { Write-Log ("Restored bookmarks into {0} profile(s)." -f $restored) OK; return $true }
+    Write-Log 'No applicable browser bookmarks to restore - skipped.' INFO
+    return 'SKIP'
 }
 
 #endregion
