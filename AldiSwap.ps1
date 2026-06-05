@@ -380,7 +380,7 @@ function Write-JsonFile {
     param($Object, [Parameter(Mandatory)][string]$Path, [int]$Depth = 5)
     New-DirIfMissing (Split-Path $Path -Parent)
     $json = $Object | ConvertTo-Json -Depth $Depth
-    if ($null -eq $json) { $json = '[]' }
+    if ([string]::IsNullOrWhiteSpace($json)) { $json = '[]' }
     Set-Content -Path $Path -Value $json -Encoding UTF8
 }
 
@@ -531,11 +531,11 @@ function Write-HealthItem {
 
 function Write-BoxRule { param([string]$Ch = '=', [ConsoleColor]$Color = 'Cyan') Write-Host ('  +' + ($Ch * $Script:BoxWidth) + '+') -ForegroundColor $Color }
 function Write-BoxRow {
+    # ONE Write-Host: multi-segment -NoNewline lines get split onto separate lines in a transcript
+    # log (that's why the boxed titles looked broken in the saved log).
     param([string]$Text, [ConsoleColor]$Color = 'White')
     if ($Text.Length -gt $Script:BoxWidth - 2) { $Text = $Text.Substring(0, $Script:BoxWidth - 2) }
-    Write-Host '  |' -NoNewline -ForegroundColor Cyan
-    Write-Host (' ' + $Text.PadRight($Script:BoxWidth - 1)) -NoNewline -ForegroundColor $Color
-    Write-Host '|' -ForegroundColor Cyan
+    Write-Host ('  | ' + $Text.PadRight($Script:BoxWidth - 1) + '|') -ForegroundColor $Color
 }
 
 function Show-AppHeader {
@@ -635,10 +635,12 @@ function Get-OneNoteNotebookList {
         $doc = New-Object System.Xml.XmlDocument
         $doc.LoadXml($xml)
         # local-name() ignores the schema-version namespace, so this works on any Office build.
-        $nb = $doc.SelectNodes("//*[local-name()='Notebook']") | ForEach-Object {
+        # Output the objects directly - callers wrap with @() to get a clean array. We must NOT use
+        # ,@(...) here: it nests the array so ConvertTo-Json emits a {"value":[...],"Count":N}
+        # wrapper, which loses Name/Path on round-trip (the cause of the "property 'Path' not found").
+        $doc.SelectNodes("//*[local-name()='Notebook']") | ForEach-Object {
             [PSCustomObject]@{ Name = $_.GetAttribute('name'); Path = $_.GetAttribute('path') }
         }
-        return ,@($nb)   # always an array, even for 0 or 1 notebook (prevents null-bind downstream)
     } catch {
         Write-Log "Failed to read OneNote hierarchy: $($_.Exception.Message)" ERROR
         return @()
@@ -659,8 +661,10 @@ function Export-OneNoteRegistry {
 
 function New-OneNoteShortcuts {
     param([switch]$OpenFolder)   # on restore, pop the folder open so the tech can click the shortcuts
-    $json = Read-JsonFile $Script:Paths.OneNoteJson
-    if (-not $json) { Write-Log 'No notebook list to build shortcuts from.' WARN; return }
+    # Keep only well-formed entries (guards against an older/malformed JSON missing Path).
+    $json = @(Read-JsonFile $Script:Paths.OneNoteJson) | Where-Object { $_ -and $_.PSObject.Properties['Path'] }
+    $json = @($json)
+    if ($json.Count -eq 0) { Write-Log 'No notebook list to build shortcuts from.' WARN; return }
     $dir = $Script:Paths.OneNoteShortcuts
     New-DirIfMissing $dir
     $shell = New-Object -ComObject WScript.Shell
@@ -737,8 +741,10 @@ function Show-NotebookTable {
 function Find-LocalNotebook {
     # BACKUP-side: show the notebook table (name / location / path + counts) live so the tech can
     # see it, and flag any notebook on a local C:\ or shared drive ('Other') - those won't migrate.
-    $list = @(Read-JsonFile $Script:Paths.OneNoteJson)
-    if (-not $list -or $list.Count -eq 0) { Write-Log 'No notebooks captured to inspect.' WARN; return $true }
+    # Keep only well-formed entries (guards against an older/malformed JSON missing Path).
+    $list = @(Read-JsonFile $Script:Paths.OneNoteJson) | Where-Object { $_ -and $_.PSObject.Properties['Path'] }
+    $list = @($list)
+    if ($list.Count -eq 0) { Write-Log 'No notebooks captured to inspect.' WARN; return $true }
 
     Show-NotebookTable -Notebooks $list
 
@@ -1306,9 +1312,11 @@ function Show-Checklist {
     foreach ($ph in $phases) {
         if ($ph -ne 'General') { Write-Host ("   {0}" -f $ph.ToUpper()) -ForegroundColor DarkCyan }
         foreach ($s in ($Script:Steps | Where-Object { $_.Phase -eq $ph })) {
-            Write-Host ("    [{0,2}/{1}]  {2}  {3,-24}" -f $s.Num, $total, $Script:Marks[$s.Status], $s.Step) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status]
-            if ($s.Detail) { Write-Host (" {0}" -f $s.Detail) -NoNewline -ForegroundColor $Script:MarkColor[$s.Status] }
-            Write-Host ("  [{0}s]" -f $s.Seconds) -ForegroundColor DarkGray
+            # Build the whole line, then ONE Write-Host (keeps it intact in the transcript log).
+            $line = "    [{0,2}/{1}]  {2}  {3,-24}" -f $s.Num, $total, $Script:Marks[$s.Status], $s.Step
+            if ($s.Detail) { $line += " {0}" -f $s.Detail }
+            $line += "  [{0}s]" -f $s.Seconds
+            Write-Host $line -ForegroundColor $Script:MarkColor[$s.Status]
         }
     }
 
