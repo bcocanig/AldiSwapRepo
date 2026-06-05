@@ -104,29 +104,87 @@ $Script:Browsers = @(
     @{ Name = 'Chrome'; Base = 'Google\Chrome\User Data';  Process = 'chrome' }
 )
 
-# Installed-app inventory map (Application -> install path / wildcard to probe)
-$Script:AppMap = [ordered]@{
-    'RedPrairie (MCH)'     = 'C:\Program Files (x86)\RedPrairie\MOCA\client'
-    'Tableau Prep'         = 'C:\Program Files\Tableau Prep Builder'
-    'Tableau Desktop'      = 'C:\Program Files\Tableau'
-    'Spaceman'             = 'C:\Program Files\Spaceman'
-    'Kofax'                = 'C:\Program Files (x86)\Kofax\AcrobatConnector'
-    'Alteryx'              = 'C:\Program Files\Alteryx'
-    'Git'                  = 'C:\Program Files\Git'
-    'SSMS'                 = 'C:\Program Files (x86)\Microsoft SQL Server Management Studio*'
-    'Anaconda'             = 'C:\Program Files\Anaconda3\python.exe'
-    'Python'               = 'C:\Program Files\Python*\python.exe'
-    '7-Zip'                = 'C:\Program Files\7-Zip\7z.exe'
-    'Notepad++'            = 'C:\Program Files\Notepad++\notepad++.exe'
-    'Visio'                = 'C:\Program Files\Microsoft Office\root\Office16\VISIO.EXE'
-    'Adobe Creative Cloud' = 'C:\Program Files (x86)\Adobe\Adobe Creative Cloud\CoreSync\CoreSync.exe'
-    'Think-Cell'           = 'C:\Program Files\think-cell'
-    'Visual Studio Code'   = 'C:\Program Files\Microsoft VS Code\Code.exe'
-    'Visual Studio'        = 'C:\Program Files*\Microsoft Visual Studio\*\*\Common7\IDE\devenv.exe'
-    'KeePass'              = 'C:\Program Files (x86)\KeePass Password Safe 2\KeePass.exe'
-    'Kerberos'             = 'C:\Program Files (x86)\Kerberos\Kerberos.exe'
-    'JDA Enterprise Client'= 'C:\Program Files (x86)\JDA\Enterprise*'
-}
+# Installed-software report: we enumerate every program from the registry uninstall keys and
+# hide this corporate/system baseline so only the apps a tech must reinstall remain. Edit freely.
+# (Folded in from InstalledProgramsTest.ps1.) Patterns are -like wildcards, case-insensitive.
+$Script:AppExclude = @(
+    '2013.12.13 Enterprise Client Controls*'
+    '64 Bit HP CIO Components Installer*'
+    '*aldi-support.beyondtrustcloud.com*'
+    '*OneDrive*'
+    'Active Directory Rights*'
+    'Adobe Acrobat Reader*'
+    'ALDI Encryption Add-in for Outlook*'
+    'ALDI Font SUED OT 1.0.0.0*'
+    'ALDI LAN Desk Compliance Status Check Client*'
+    'ALDI LANDESK Compliance Check*'
+    'ALDI SUED Fonts*'
+    'AppProtection*'
+    'Assima Application Listener*'
+    'Cherry SmartCard Package V3.3 Build 9*'
+    'Cirrus Audio*'
+    'Citrix*'
+    'ClickShare Extension Pack*'
+    'CryptoPro*'
+    'Customer Support*'
+    'Dell*'
+    'DFUDriverSetupX64Setup*'
+    'DisplayLink Graphics*'
+    'Dynamic Application*'
+    'Eclipse Temurin JRE with Hotspot*'
+    'EU Waste Recycling Information*'
+    'Forticlient*'
+    'Greenshot 1.3.315*'
+    'Information Center*'
+    '*ntel*'
+    'Ivanti*'
+    'Jabra*'
+    'LANDESK Advance Agent*'
+    'Microsoft .NET*'
+    'Microsoft 365*'
+    'Microsoft ASP*'
+    'Microsoft Device*'
+    'Microsoft Edge*'
+    'Microsoft Intune*'
+    'Microsoft Purview Information Protection*'
+    'Microsoft SQL Server 2008*'
+    'Microsoft SQL Server 2012*'
+    'Microsoft Teams*'
+    'Microsoft Visio Viewer 2016*'
+    'Microsoft Visual C++*'
+    'Microsoft Visual Studio 2010 Tools for Office Runtime (x64)*'
+    'Microsoft Windows*'
+    'MTOP Client*'
+    'Nagyv*llalati*'
+    'Office 16 Click-to-Run Extensibility Component*'
+    'Office 16 Click-to-Run Localization Component*'
+    'Okta Device Access*'
+    'Okta Verify*'
+    'OktaVerify-x64-*'
+    'Online Plug-in*'
+    'Phish Alert*'
+    'PowerToys (Preview) x64*'
+    'Programi Microsoft 365 za podjetja - sl-si*'
+    'Programi Microsoft 365 za podjetja - sl-si.proof*'
+    'Realtek*'
+    'Required Runtimes*'
+    'SAP Crystal Reports runtime engine for .NET Framework (32-bit)*'
+    'SAP Crystal Reports runtime engine for .NET Framework (64-bit)*'
+    'Self-service Plug-in*'
+    'Silverfort Client*'
+    'Skyhigh Client Proxy*'
+    'SQL Server-Berichts-Generator 3 fur SQL Server 2014*'
+    'SQL Server-Berichts-Generator*'
+    'TbtLegacy*'
+    'Teams Machine-Wide Installer*'
+    'Thunderbolt*'
+    'Trellix Agent*'
+    'Trellix Data Exchange Layer for TA*'
+    'Trend Micro Apex One Security Agent*'
+    'USB Drive Letter Manager (x64)*'
+    'Update for*'
+    'Visual Studio Tools for the Office system 3.0 Runtime*'
+)
 
 # Runtime state
 $Script:Unattended  = $false   # when true, prompts auto-accept their default
@@ -136,7 +194,7 @@ $Script:OneNoteApp  = $null
 
 # Cached connectivity/health + backup counts (populated by Update-HealthStatus)
 $Script:Health       = $null
-$Script:BackupCounts = @{ F = 0; O = 0 }
+$Script:BackupCounts = @{ F = 0; O = 0; T = 0 }
 
 # Sanity-check / progress state (populated per pipeline run)
 $Script:Steps       = New-Object System.Collections.Generic.List[object]
@@ -434,6 +492,9 @@ function Update-HealthStatus {
     if ($fdPath) {
         try { if (Test-Path -LiteralPath (Join-Path $fdPath "Backup_$env:USERNAME")) { $fCount = 1 } } catch { }
     }
+    $tCount = 0
+    if ((Test-Path -LiteralPath $Script:Config.Root) -and
+        (@(Get-ChildItem $Script:Config.Root -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'Logs' }).Count -gt 0)) { $tCount = 1 }
 
     $Script:Health = [ordered]@{
         OneDriveFound   = [bool]$odPath
@@ -443,7 +504,7 @@ function Update-HealthStatus {
         CorpReachable   = $corp
         CheckedAt       = (Get-Date)
     }
-    $Script:BackupCounts = @{ F = $fCount; O = $oCount }
+    $Script:BackupCounts = @{ F = $fCount; O = $oCount; T = $tCount }
     return $Script:Health
 }
 
@@ -474,16 +535,17 @@ function Show-AppHeader {
     if ($Subtitle) { Write-Host ("   >> {0}" -f $Subtitle) -ForegroundColor Cyan }
     Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
 
-    # Health strip (each pill coloured independently)
-    $odState = if ($h.OneDriveOnline) { 'ok' } elseif ($h.OneDriveFound) { 'warn' } else { 'bad' }
-    $odLabel = if ($h.OneDriveOnline) { 'OneDrive online' }
-               elseif ($h.OneDriveFound -and -not $h.OneDriveRunning) { 'OneDrive NOT running' }
-               elseif ($h.OneDriveFound) { 'OneDrive offline' }
-               else { 'OneDrive missing' }
+    # Health strip (each pill coloured independently). A present OneDrive *folder* is not enough -
+    # OneDrive.exe must be running or nothing syncs, so that state shows RED.
+    $odOk    = $h.OneDriveFound -and $h.OneDriveRunning
+    $odState = if ($odOk) { 'ok' } else { 'bad' }
+    $odLabel = if (-not $h.OneDriveFound) { 'OneDrive not found' }
+               elseif (-not $h.OneDriveRunning) { 'OneDrive NOT running' }
+               else { 'OneDrive online' }
     $fdState = if ($h.FDriveOnline) { 'ok' } else { 'bad' }
     $fdLabel = if ($h.FDriveOnline) { 'F: online' } else { 'F: unreachable' }
     $npState = if ($h.CorpReachable) { 'ok' } else { 'bad' }
-    $npLabel = "Net $($Script:Config.CorpHost)"
+    $npLabel = if ($h.CorpReachable) { 'Network reachable' } else { 'Network unreachable' }
 
     Write-Host '   Health ' -NoNewline -ForegroundColor Gray
     Write-HealthItem $odState $odLabel
@@ -491,9 +553,9 @@ function Show-AppHeader {
     Write-HealthItem $npState $npLabel
     Write-Host ''
 
-    # Backup counts (the "1F 2O" at-a-glance, item #5)
-    Write-Host ("   Backups  {0}F  {1}O" -f $c.F, $c.O) -NoNewline -ForegroundColor White
-    Write-Host ("   (F:/OneDrive found for {0})   checked {1:HH:mm:ss}" -f $env:USERNAME, $h.CheckedAt) -ForegroundColor DarkGray
+    # Backup counts (item #2)
+    Write-Host ("   Backups found: {0} Fdrive, {1} Onedrive, {2} temp" -f $c.F, $c.O, $c.T) -NoNewline -ForegroundColor White
+    Write-Host ("    checked {0:HH:mm:ss}" -f $h.CheckedAt) -ForegroundColor DarkGray
     Write-Host '  ===============================================================' -ForegroundColor Cyan
 }
 
@@ -852,30 +914,54 @@ function Get-DeviceSummary {
 }
 
 function Get-InstalledAppList {
-    $rows = foreach ($name in $Script:AppMap.Keys) {
-        $hit = Get-Item -Path $Script:AppMap[$name] -ErrorAction SilentlyContinue | Select-Object -First 1
-        [PSCustomObject]@{
-            Application = $name
-            Installed   = [bool]$hit
-            Path        = if ($hit) { $hit.FullName } else { 'not found' }
+    # Enumerate genuinely-installed software from the registry uninstall keys (machine-wide
+    # 64/32-bit + current user), drop the corporate/system baseline via $Script:AppExclude,
+    # and show what a tech would actually need to reinstall on the new machine.
+    $paths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($path in $paths) {
+        if (-not (Test-Path $path)) { continue }
+        foreach ($key in (Get-ChildItem $path -ErrorAction SilentlyContinue)) {
+            $item = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+            if (-not $item) { continue }
+            $dnProp = $item.PSObject.Properties['DisplayName']
+            if (-not $dnProp -or [string]::IsNullOrWhiteSpace($dnProp.Value)) { continue }
+            # Skip system components and entries Windows flags as updates/patches.
+            $scProp = $item.PSObject.Properties['SystemComponent']
+            if ($scProp -and $scProp.Value -eq 1) { continue }
+            $names.Add(([string]$dnProp.Value).Trim())
         }
     }
 
-    # Print a coloured table of EVERY tracked app to the terminal (green check = installed).
-    Write-Host ''
-    Write-Host '  Installed application report' -ForegroundColor Cyan
-    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
-    foreach ($r in $rows) {
-        $mark = if ($r.Installed) { [char]0x2713 } else { [char]0x2717 }
-        $col  = if ($r.Installed) { 'Green' } else { 'DarkGray' }
-        Write-Host ("   {0}  {1,-26}  {2}" -f $mark, $r.Application, $r.Path) -ForegroundColor $col
-    }
-    $yes = @($rows | Where-Object Installed).Count
-    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
-    Write-Host ("   {0} of {1} tracked apps installed" -f $yes, $rows.Count) -ForegroundColor White
+    # Keep only the "real" user-facing apps: dedupe, drop lowercase-leading noise (drivers/
+    # runtimes), keep a single Python, and strip the corporate baseline.
+    $unique     = @($names | Sort-Object -Unique)
+    $pythonCore = $unique | Where-Object { $_ -like 'Python 3.*Core Interpreter*' } | Sort-Object -Descending | Select-Object -First 1
+    $apps = @($unique | Where-Object {
+        $n = $_
+        if ($n[0] -cmatch '[a-z]') { return $false }
+        if ($n -like 'Python 3.*') { return ($n -eq $pythonCore) }
+        return (-not ($Script:AppExclude | Where-Object { $n -like $_ }))
+    })
 
-    Write-JsonFile -Object $rows -Path $Script:Paths.AppList
-    Write-Log "App inventory -> $($Script:Paths.AppList)" OK
+    Write-Host ''
+    Write-Host '  Installed software to reinstall on the new machine' -ForegroundColor Cyan
+    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+    if ($apps.Count -eq 0) {
+        Write-Host '   (nothing left after filtering the corporate baseline)' -ForegroundColor DarkGray
+    } else {
+        foreach ($a in $apps) { Write-Host ("   - {0}" -f $a) -ForegroundColor Green }
+    }
+    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+    Write-Host ("   {0} app(s) after filtering   (tune the list in `$Script:AppExclude)" -f $apps.Count) -ForegroundColor White
+
+    Write-JsonFile -Object @($apps | ForEach-Object { [PSCustomObject]@{ DisplayName = $_ } }) -Path $Script:Paths.AppList
+    Write-Log "Installed-software list -> $($Script:Paths.AppList) ($($apps.Count) apps)" OK
     return $true
 }
 
@@ -926,10 +1012,12 @@ function Save-Backup {
             if (-not (Invoke-Robocopy -Source $root -Destination (Join-Path $dest 'LaptopTransferBackups'))) { return $false }
 
             # The copy only landed in the LOCAL OneDrive folder - the real upload is OneDrive's
-            # background sync, so confirm it can actually happen (items #1 and #2).
+            # background sync. A present folder does NOT mean OneDrive is working, so verify it.
             if (-not (Test-OneDriveRunning)) {
-                Write-Log 'OneDrive.exe is not running - files are staged locally but will NOT sync until it starts.' WARN
-                return 'WARN'
+                Add-ReportFlag -Level Error -Title 'OneDrive is NOT running - backup did not sync to the cloud' `
+                               -Detail 'Start OneDrive.exe, let it finish syncing, then re-run the backup.'
+                Write-Log 'OneDrive.exe is not running - backup staged locally but will NOT sync. Treating as a failure.' ERROR
+                return $false   # not actually in the cloud -> RED
             }
             if (-not (Test-CorpNetwork)) {
                 Write-Log 'No network connectivity - OneDrive cannot upload this backup right now.' ERROR
@@ -1149,16 +1237,12 @@ function Invoke-Pipeline {
     $Script:StepIndex = 0
     $Script:StepTotal = $Steps.Count
     $Script:RunStart  = Get-Date
-    $n = 0
     foreach ($s in $Steps) {
-        $n++
-        Write-Progress -Activity $Title -Status ("[{0}/{1}] {2}" -f $n, $Steps.Count, $s.Name) -PercentComplete ([int]((($n - 1) / $Steps.Count) * 100))
         # Verify/Optional are optional keys; access via ContainsKey so StrictMode stays happy.
         $verify   = if ($s.ContainsKey('Verify'))   { $s.Verify }        else { $null }
         $optional = if ($s.ContainsKey('Optional')) { [bool]$s.Optional } else { $false }
         Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $verify -Optional:$optional
     }
-    Write-Progress -Activity $Title -Completed
     Show-Checklist -Title $Title
 }
 
@@ -1186,7 +1270,7 @@ function Start-SwapBackup {
             @{ Name='Wallpaper';             Action={ Backup-Wallpaper }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Wallpaper -File -ErrorAction SilentlyContinue).Count -gt 0 } }
             @{ Name='Browser bookmarks';     Action={ Backup-BrowserBookmark }; Optional=$true;     Verify={ Test-Path $Script:Paths.Bookmarks } }
             @{ Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
-            @{ Name='App inventory';         Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
+            @{ Name='Installed software';    Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
             @{ Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
             @{ Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive } }
             @{ Name='Push to F: drive';      Action={ Save-Backup -Target FDrive } }
@@ -1245,7 +1329,7 @@ function Show-Menu {
         '1' = @{ Group = 'Backup';  Text = 'Full Backup';                 Action = { Start-SwapBackup } }
         '2' = @{ Group = 'Restore'; Text = 'Restore (choose a backup)';   Action = { Start-SwapRestore } }
         '3' = @{ Group = 'Tools';   Text = 'Repair Outlook profile';      Action = { Repair-OutlookProfile } }
-        '4' = @{ Group = 'Tools';   Text = 'Show installed apps';         Action = { Get-InstalledAppList } }
+        '4' = @{ Group = 'Tools';   Text = 'Installed software (to reinstall)'; Action = { Get-InstalledAppList } }
         '5' = @{ Group = 'Tools';   Text = 'Connectivity / health check'; Action = { Show-HealthDetail } }
     }
 
