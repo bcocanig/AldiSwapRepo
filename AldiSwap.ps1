@@ -718,29 +718,31 @@ function Get-NotebookLocation {
 }
 
 function Show-NotebookTable {
-    # Readable, colour-coded table of every notebook + where it lives. Shown during the run so
-    # the tech can immediately spot notebooks that are local/shared (red) and won't migrate.
+    # Per-notebook "card" layout: colour-coded location tag + full name on one line, full path
+    # indented below. Long SharePoint/OneDrive URLs no longer wreck a fixed-column table, and
+    # local/shared notebooks (red) stand out for the tech.
     param([System.Collections.IEnumerable]$Notebooks)
     $list = @($Notebooks)
-    Write-Host ''
-    Write-Host ("  OneNote notebooks ({0})" -f $list.Count) -ForegroundColor Cyan
-    Write-Host ('  ' + ('-' * ($Script:BoxWidth + 2))) -ForegroundColor DarkCyan
-    Write-Host ("   {0,-12} {1,-30} {2}" -f 'Location', 'Notebook', 'Path') -ForegroundColor Gray
     $od = 0; $sp = 0; $ot = 0
+    Write-Host ''
+    Write-Host ("   OneNote notebooks  -  {0} found" -f $list.Count) -ForegroundColor Cyan
+    Write-Host ('   ' + ('-' * 64)) -ForegroundColor DarkCyan
+    $i = 0
     foreach ($nb in $list) {
+        $i++
         $loc = Get-NotebookLocation $nb.Path
         switch ($loc) {
             'OneDrive'   { $col = 'Green'; $tag = 'OneDrive';   $od++ }
             'SharePoint' { $col = 'Cyan';  $tag = 'SharePoint'; $sp++ }
-            default      { $col = 'Red';   $tag = 'Other (!)';  $ot++ }
+            default      { $col = 'Red';   $tag = 'LOCAL!';     $ot++ }
         }
         $nm = if ($nb.Name) { [string]$nb.Name } else { '(unnamed)' }
-        if ($nm.Length -gt 29) { $nm = $nm.Substring(0, 27) + '..' }
-        Write-Host ("   {0,-12} {1,-30} {2}" -f $tag, $nm, $nb.Path) -ForegroundColor $col
+        Write-Host ("   {0,2}. [{1}]  {2}" -f $i, $tag.PadRight(10), $nm) -ForegroundColor $col
+        Write-Host ("        {0}" -f $nb.Path) -ForegroundColor DarkGray
     }
-    Write-Host ('  ' + ('-' * ($Script:BoxWidth + 2))) -ForegroundColor DarkCyan
-    Write-Host ("   OneDrive: {0}    SharePoint: {1}    Other: {2}    (total {3})" -f $od, $sp, $ot, $list.Count) -ForegroundColor White
-    if ($ot -gt 0) { Write-Host ("   ! {0} notebook(s) are LOCAL or on a shared drive and will NOT migrate." -f $ot) -ForegroundColor Red }
+    Write-Host ('   ' + ('-' * 64)) -ForegroundColor DarkCyan
+    Write-Host ("   Total {0}    OneDrive {1}    SharePoint {2}    Other {3}" -f $list.Count, $od, $sp, $ot) -ForegroundColor White
+    if ($ot -gt 0) { Write-Host ("   !  {0} notebook(s) are LOCAL or on a shared drive - they will NOT migrate." -f $ot) -ForegroundColor Red }
 }
 
 function Find-LocalNotebook {
