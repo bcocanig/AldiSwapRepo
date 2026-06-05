@@ -911,6 +911,7 @@ function Restore-BrowserBookmark {
 
 function Get-DeviceSummary {
     # (Renamed from the old Get-ComputerInfo, which shadowed the built-in cmdlet.)
+    param([switch]$Quiet)
     $info = [ordered]@{
         'Device Name' = $env:COMPUTERNAME
         'User'        = $env:USERNAME
@@ -922,12 +923,14 @@ function Get-DeviceSummary {
         'BIOS'        = (Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion
         'Service Tag' = (Get-CimInstance Win32_BIOS).SerialNumber
     }
-    $info.GetEnumerator() | ForEach-Object { Write-Log ("{0}: {1}" -f $_.Key, ($_.Value -join ', ')) INFO }
+    if (-not $Quiet) { $info.GetEnumerator() | ForEach-Object { Write-Log ("{0}: {1}" -f $_.Key, ($_.Value -join ', ')) INFO } }
     Write-JsonFile -Object $info -Path $Script:Paths.ComputerInfo
-    Write-Log "Device summary -> $($Script:Paths.ComputerInfo)" OK
+    Write-Log ("Device summary captured: {0}, service tag {1}" -f $info['Model'], $info['Service Tag']) OK
+    return $true
 }
 
 function Get-InstalledAppList {
+    param([switch]$Quiet)   # -Quiet does the work + saves JSON but skips the on-screen table (backup use)
     # Enumerate genuinely-installed software from the registry uninstall keys (machine-wide
     # 64/32-bit + current user), drop the corporate/system baseline via $Script:AppExclude,
     # and show what a tech would actually need to reinstall on the new machine.
@@ -963,16 +966,18 @@ function Get-InstalledAppList {
         return (-not ($Script:AppExclude | Where-Object { $n -like $_ }))
     })
 
-    Write-Host ''
-    Write-Host '  Installed software to reinstall on the new machine' -ForegroundColor Cyan
-    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
-    if ($apps.Count -eq 0) {
-        Write-Host '   (nothing left after filtering the corporate baseline)' -ForegroundColor DarkGray
-    } else {
-        foreach ($a in $apps) { Write-Host ("   - {0}" -f $a) -ForegroundColor Green }
+    if (-not $Quiet) {
+        Write-Host ''
+        Write-Host '  Installed software to reinstall on the new machine' -ForegroundColor Cyan
+        Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+        if ($apps.Count -eq 0) {
+            Write-Host '   (nothing left after filtering the corporate baseline)' -ForegroundColor DarkGray
+        } else {
+            foreach ($a in $apps) { Write-Host ("   - {0}" -f $a) -ForegroundColor Green }
+        }
+        Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
+        Write-Host ("   {0} app(s) after filtering   (tune the list in `$Script:AppExclude)" -f $apps.Count) -ForegroundColor White
     }
-    Write-Host '  ---------------------------------------------------------------' -ForegroundColor DarkCyan
-    Write-Host ("   {0} app(s) after filtering   (tune the list in `$Script:AppExclude)" -f $apps.Count) -ForegroundColor White
 
     Write-JsonFile -Object @($apps | ForEach-Object { [PSCustomObject]@{ DisplayName = $_ } }) -Path $Script:Paths.AppList
     Write-Log "Installed-software list -> $($Script:Paths.AppList) ($($apps.Count) apps)" OK
@@ -1145,7 +1150,6 @@ function Invoke-SwapStep {
     )
     $Script:StepIndex++
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Log ("[{0}/{1}] {2}" -f $Script:StepIndex, $Script:StepTotal, $Name) STEP
 
     $status = 'Pass'; $detail = ''
     try {
@@ -1285,11 +1289,18 @@ function Invoke-Pipeline {
     $Script:StepIndex = 0
     $Script:StepTotal = $Steps.Count
     $Script:RunStart  = Get-Date
+    $lastPhase = $null
     foreach ($s in $Steps) {
         # Verify/Optional/Phase are optional keys; access via ContainsKey so StrictMode stays happy.
         $verify   = if ($s.ContainsKey('Verify'))   { $s.Verify }        else { $null }
         $optional = if ($s.ContainsKey('Optional')) { [bool]$s.Optional } else { $false }
         $phase    = if ($s.ContainsKey('Phase'))    { [string]$s.Phase }  else { 'General' }
+        # Print a category header (with breathing room) whenever the phase changes.
+        if ($phase -ne $lastPhase) {
+            Write-Host ''
+            Write-Host ("  -- {0} --" -f $phase) -ForegroundColor DarkCyan
+            $lastPhase = $phase
+        }
         Invoke-SwapStep -Name $s.Name -Action $s.Action -Verify $verify -Optional:$optional -Phase $phase
     }
     Show-Checklist -Title $Title
@@ -1308,22 +1319,22 @@ function Start-SwapBackup {
     Start-SwapLog
     try {
         $steps = @(
-            @{ Phase='Capture';   Name='Device summary';        Action={ Get-DeviceSummary };                          Verify={ Test-Path $Script:Paths.ComputerInfo } }
-            @{ Phase='Capture';   Name='Email signatures';      Action={ Sync-Signature -Direction Backup }; Optional=$true; Verify={ "$(@(Get-ChildItem $Script:Paths.Signatures -Recurse -File -ErrorAction SilentlyContinue).Count) files" } }
-            @{ Phase='Capture';   Name='OneNote notebook list'; Action={ Export-OneNoteNotebooks };                    Verify={ $j=Read-JsonFile $Script:Paths.OneNoteJson; if ($j) { "$(@($j).Count) notebooks" } else { $false } } }
-            @{ Phase='Capture';   Name='Local-notebook check';  Action={ Find-LocalNotebook } }
-            @{ Phase='Capture';   Name='OneNote shortcuts';     Action={ New-OneNoteShortcuts }; Optional=$true;       Verify={ Test-Path $Script:Paths.OneNoteShortcuts } }
-            @{ Phase='Capture';   Name='OneNote registry';      Action={ Export-OneNoteRegistry };                     Verify={ Test-Path $Script:Paths.OneNoteReg } }
-            @{ Phase='Capture';   Name='Outlook profile';       Action={ Export-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path (Join-Path $Script:Paths.OutlookRegDir 'OldPcOutlook.reg') } }
-            @{ Phase='Capture';   Name='Quick Access';          Action={ Backup-QuickAccess };                         Verify={ $n=@(Get-ChildItem $Script:Paths.QuickAccess -File -ErrorAction SilentlyContinue).Count; if ($n -gt 0) { "$n files" } else { $false } } }
-            @{ Phase='Capture';   Name='Downloads';             Action={ Backup-Downloads }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Downloads -Filter *.zip -ErrorAction SilentlyContinue).Count -gt 0 } }
-            @{ Phase='Capture';   Name='Wallpaper';             Action={ Backup-Wallpaper }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Wallpaper -File -ErrorAction SilentlyContinue).Count -gt 0 } }
-            @{ Phase='Capture';   Name='Browser bookmarks';     Action={ Backup-BrowserBookmark }; Optional=$true;     Verify={ Test-Path $Script:Paths.Bookmarks } }
-            @{ Phase='Capture';   Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
-            @{ Phase='Capture';   Name='Installed software';    Action={ Get-InstalledAppList };                       Verify={ Test-Path $Script:Paths.AppList } }
-            @{ Phase='Transport'; Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
-            @{ Phase='Transport'; Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive } }
-            @{ Phase='Transport'; Name='Push to F: drive';      Action={ Save-Backup -Target FDrive } }
+            @{ Phase='System info';     Name='Device summary';        Action={ Get-DeviceSummary -Quiet };                   Verify={ Test-Path $Script:Paths.ComputerInfo } }
+            @{ Phase='System info';     Name='Installed software';    Action={ Get-InstalledAppList -Quiet };                Verify={ Test-Path $Script:Paths.AppList } }
+            @{ Phase='Email & Outlook'; Name='Email signatures';      Action={ Sync-Signature -Direction Backup }; Optional=$true; Verify={ "$(@(Get-ChildItem $Script:Paths.Signatures -Recurse -File -ErrorAction SilentlyContinue).Count) files" } }
+            @{ Phase='Email & Outlook'; Name='Outlook profile';       Action={ Export-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path (Join-Path $Script:Paths.OutlookRegDir 'OldPcOutlook.reg') } }
+            @{ Phase='OneNote';         Name='OneNote notebook list'; Action={ Export-OneNoteNotebooks };                    Verify={ $j=Read-JsonFile $Script:Paths.OneNoteJson; if ($j) { "$(@($j).Count) notebooks" } else { $false } } }
+            @{ Phase='OneNote';         Name='Local-notebook check';  Action={ Find-LocalNotebook } }
+            @{ Phase='OneNote';         Name='OneNote shortcuts';     Action={ New-OneNoteShortcuts }; Optional=$true;       Verify={ Test-Path $Script:Paths.OneNoteShortcuts } }
+            @{ Phase='OneNote';         Name='OneNote registry';      Action={ Export-OneNoteRegistry };                     Verify={ Test-Path $Script:Paths.OneNoteReg } }
+            @{ Phase='User files';      Name='Quick Access';          Action={ Backup-QuickAccess };                         Verify={ $n=@(Get-ChildItem $Script:Paths.QuickAccess -File -ErrorAction SilentlyContinue).Count; if ($n -gt 0) { "$n files" } else { $false } } }
+            @{ Phase='User files';      Name='Downloads';             Action={ Backup-Downloads }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Downloads -Filter *.zip -ErrorAction SilentlyContinue).Count -gt 0 } }
+            @{ Phase='User files';      Name='Wallpaper';             Action={ Backup-Wallpaper }; Optional=$true;           Verify={ @(Get-ChildItem $Script:Paths.Wallpaper -File -ErrorAction SilentlyContinue).Count -gt 0 } }
+            @{ Phase='User files';      Name='Browser bookmarks';     Action={ Backup-BrowserBookmark }; Optional=$true;     Verify={ Test-Path $Script:Paths.Bookmarks } }
+            @{ Phase='User files';      Name='Folder trees';          Action={ Save-FolderTree -Directory (Join-Path $env:USERPROFILE 'Downloads') -Label 'Downloads' }; Verify={ Test-Path (Join-Path $Script:Paths.Trees 'Downloads.txt') } }
+            @{ Phase='Save backup';     Name='Write manifest';        Action={ Write-BackupManifest };                       Verify={ Test-Path $Script:Paths.Manifest } }
+            @{ Phase='Save backup';     Name='Push to OneDrive';      Action={ Save-Backup -Target OneDrive } }
+            @{ Phase='Save backup';     Name='Push to F: drive';      Action={ Save-Backup -Target FDrive } }
         )
         Invoke-Pipeline -Steps $steps -Title 'BACKUP SANITY CHECK'
         Show-SummaryCard -Mode Backup
@@ -1353,18 +1364,18 @@ function Start-SwapRestore {
 
         $steps = New-Object System.Collections.Generic.List[object]
         # Launch Outlook early so it can build its profile while the other steps run.
-        $steps.Add(@{ Phase='Restore'; Name='Launch Outlook (first run)'; Optional=$true;
+        $steps.Add(@{ Phase='Files & email'; Name='Launch Outlook (first run)'; Optional=$true;
                       Action={ $exe = Resolve-OutlookExe; if ($exe) { Start-Process $exe } else { 'SKIP' } } })
-        $steps.Add(@{ Phase='Restore'; Name='Restore signatures';        Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
-        $steps.Add(@{ Phase='Restore'; Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
-        $steps.Add(@{ Phase='Restore'; Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
+        $steps.Add(@{ Phase='Files & email'; Name='Restore signatures';        Action={ Sync-Signature -Direction Restore }; Optional=$true; Verify={ Test-Path (Join-Path $env:APPDATA 'Microsoft\Signatures') } })
+        $steps.Add(@{ Phase='Files & email'; Name='Restore Quick Access';      Action={ Restore-QuickAccess }; Verify={ @(Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -File -ErrorAction SilentlyContinue).Count -gt 0 } })
+        $steps.Add(@{ Phase='Files & email'; Name='Restore browser bookmarks'; Action={ Restore-BrowserBookmark }; Optional=$true })
         # Build the OneNote shortcuts AND pop the folder open so the tech can click straight in.
-        $steps.Add(@{ Phase='Restore'; Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts -OpenFolder }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
+        $steps.Add(@{ Phase='OneNote'; Name='OneNote shortcuts';         Action={ New-OneNoteShortcuts -OpenFolder }; Optional=$true; Verify={ Test-Path $Script:Paths.OneNoteShortcuts } })
         # Import the OpenNotebooks registry FIRST, then open OneNote and verify they reopened.
-        $steps.Add(@{ Phase='Profiles & verify'; Name='Import OneNote reg';       Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
-        $steps.Add(@{ Phase='Profiles & verify'; Name='Verify OneNote notebooks'; Action={ Test-OneNoteRestore } })
-        $steps.Add(@{ Phase='Profiles & verify'; Name='Wait for Outlook profile'; Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
-        $steps.Add(@{ Phase='Profiles & verify'; Name='Import Outlook profile';   Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
+        $steps.Add(@{ Phase='OneNote'; Name='Import OneNote reg';        Action={ Import-OneNoteRegistry }; Verify={ Test-Path "HKCU:\Software\Microsoft\Office\$Script:OfficeVer\OneNote\OpenNotebooks" } })
+        $steps.Add(@{ Phase='OneNote'; Name='Verify OneNote notebooks';  Action={ Test-OneNoteRestore } })
+        $steps.Add(@{ Phase='Outlook profile'; Name='Wait for Outlook profile'; Action={ Wait-ForOutlookProfile }; Verify={ Test-Path $Script:Reg.OutlookPS } })
+        $steps.Add(@{ Phase='Outlook profile'; Name='Import Outlook profile';   Action={ Import-OutlookProfile -Name 'OldPcOutlook' }; Verify={ Test-Path $Script:Reg.OutlookPS } })
 
         Invoke-Pipeline -Steps $steps.ToArray() -Title 'RESTORE SANITY CHECK'
         Show-SummaryCard -Mode Restore
